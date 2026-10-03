@@ -48,7 +48,9 @@ fastframe-theme = { git = "https://github.com/crmne/fastframe", tag = "v0.1.7", 
 # The terminal a release build's command-line output goes to, and the
 # Desktop and Pictures export folders.
 [features]
-default = ["telemetry"]
+# This fork reports nothing to rawmakase.com; build with `--features telemetry`
+# to bring the opt-in report back.
+default = []
 # The opt-in weekly usage report (src/stats.rs). Packagers who don't want it
 # build with --no-default-features: the question, the Preferences row and all
 # reporting are then left out.
