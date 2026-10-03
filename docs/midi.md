@@ -92,3 +92,23 @@ python3 -m venv .venv && .venv/bin/pip install -r tools/loupedeck/requirements.t
 
 They write `capture.jsonl`, `mapping.json` and `probes.jsonl` to the current
 directory.
+
+## Keeping this fork up to date
+
+This fork is the `loupedeck` branch on top of the upstream project's releases;
+`main` mirrors upstream. [tools/loupedeck/update.sh](../tools/loupedeck/update.sh)
+brings in a new release:
+
+```bash
+tools/loupedeck/update.sh --dry-run   # what is new, and would it conflict?
+tools/loupedeck/update.sh --build     # update, run the CI checks, build the app
+tools/loupedeck/update.sh --push      # also push the branch and main to origin
+```
+
+It fetches `upstream`, fast-forwards `main`, rebases `loupedeck` onto the newest
+release tag (`--main` for upstream's `main` instead), then runs `cargo fmt`,
+`clippy` and the tests (`--skip-checks` to skip). A conflict in `Cargo.lock`
+alone is resolved for you; any other conflict stops the update and leaves
+everything as it was, with the old branch kept as `backup/before-update`.
+`--build` writes `target/release/RAWmakase.app`, signed ad hoc for this Mac, with
+the icon taken from an installed RAWmakase.
