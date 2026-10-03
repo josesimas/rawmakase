@@ -74,7 +74,7 @@ impl Editor {
         let edited = self.document.history.observe(
             frame.recipe,
             &self.document.recipe,
-            ctx.input(|i| i.pointer.primary_down()),
+            ctx.input(|i| i.pointer.primary_down()) || self.surface.turning(),
         );
         if edited {
             self.document.save.mark_changed();
