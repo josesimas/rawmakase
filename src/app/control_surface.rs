@@ -8,6 +8,7 @@ mod socket;
 use super::Editor;
 use super::inspector::BANDS;
 use super::widgets::{history_step_id, slider_text};
+use crate::catalog::Photo;
 use crate::develop::{Recipe, TEMPERATURE_MAX, TEMPERATURE_MIN, TINT_LIMIT};
 use eframe::egui::{self, Event, Key, Modifiers};
 use std::{
@@ -39,6 +40,26 @@ enum Msg {
     Photo(i32),
     /// Nothing, but answered with the next frame's state.
     Ping,
+    /// Something only the app itself can do, with the result in the state.
+    Job(Job),
+}
+
+/// A photo to open: by name, or by its catalog id.
+#[derive(Debug, PartialEq)]
+enum Target {
+    Name(String),
+    Id(i64),
+}
+
+/// A command that acts on the Library rather than on a slider or a key.
+#[derive(Debug, PartialEq)]
+enum Job {
+    /// Open the photo in Develop.
+    Open(Target),
+    /// Put this in the Library's search box ("" clears it).
+    Search(String),
+    /// Switch to Develop (true) or the Library grid (false).
+    Module(bool),
 }
 
 /// A change to a slider, in the order it was asked for.
@@ -509,6 +530,10 @@ pub(super) struct Surface {
     shared: Arc<socket::Shared>,
     /// How many socket commands the last `poll` is known to have read.
     consumed: u64,
+    /// Library commands waiting for the start of the next frame.
+    jobs: Vec<Job>,
+    /// How the last of them went, for the next state.
+    result: Option<serde_json::Value>,
     /// The Mixer channel a button asked for since the last frame.
     mixer: Option<usize>,
     /// How many times Black & White was asked for since the last frame.
@@ -538,6 +563,8 @@ impl Surface {
             pending: Vec::new(),
             shared: Arc::default(),
             consumed: 0,
+            jobs: Vec::new(),
+            result: None,
             mixer: None,
             mono_toggles: 0,
             photo_ticks: 0,
@@ -637,6 +664,7 @@ impl Surface {
                     self.last_photo = Some(Instant::now());
                 }
                 Msg::Ping => {}
+                Msg::Job(job) => self.jobs.push(job),
             }
         }
         events
@@ -659,10 +687,45 @@ fn without(a: Modifiers, b: Modifiers) -> Modifiers {
     }
 }
 
+/// The photos a name stands for: the filename or the path, in any case, with or
+/// without the extension; else the ones whose name contains it. A master wins
+/// over its virtual copies, which share its filename.
+fn find_photos<'a>(photos: &'a [Photo], name: &str) -> Vec<&'a Photo> {
+    let wanted = name.trim().to_lowercase();
+    let by_path = wanted.contains(['/', '\\']);
+    let text = |p: &Photo| {
+        if by_path {
+            p.path.to_string_lossy().to_lowercase()
+        } else {
+            p.filename.to_lowercase()
+        }
+    };
+    let stem = |p: &Photo| {
+        std::path::Path::new(&text(p))
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+    };
+    let pick = |matching: &dyn Fn(&Photo) -> bool| -> Vec<&'a Photo> {
+        let all: Vec<&Photo> = photos.iter().filter(|p| matching(p)).collect();
+        let masters: Vec<&Photo> = all.iter().copied().filter(|p| p.master.is_none()).collect();
+        if masters.is_empty() { all } else { masters }
+    };
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    let exact = pick(&|p| text(p) == wanted || (!by_path && stem(p).as_deref() == Some(&wanted)));
+    if exact.is_empty() {
+        pick(&|p| text(p).contains(&wanted))
+    } else {
+        exact
+    }
+}
+
 impl Editor {
     /// Start of the frame: button presses reach the shortcut handlers as if typed.
     pub(super) fn surface_buttons(&mut self, ctx: &egui::Context) {
         let events = self.surface.poll();
+        self.surface_jobs();
         if let Some(channel) = self.surface.mixer.take() {
             // The HSL view, where the selector is, so the screen shows what the faders turn.
             self.view.mixer_adjust = channel;
@@ -710,6 +773,102 @@ impl Editor {
     pub(super) fn surface_dials(&mut self, ctx: &egui::Context) {
         self.apply_edits(ctx);
         self.surface_publish();
+    }
+    /// Library commands from the socket, at the start of the frame.
+    fn surface_jobs(&mut self) {
+        for job in std::mem::take(&mut self.surface.jobs) {
+            let done = match job {
+                Job::Search(text) => self.surface_search(&text),
+                Job::Module(true) => self.surface_develop(),
+                Job::Module(false) => self.surface_library(),
+                Job::Open(target) => self.surface_open(&target),
+            };
+            self.surface.result = Some(match done {
+                Ok(mut json) => {
+                    json["ok"] = true.into();
+                    json
+                }
+                Err(error) => serde_json::json!({"ok": false, "error": error}),
+            });
+        }
+    }
+    fn surface_search(&mut self, text: &str) -> Result<serde_json::Value, String> {
+        let library = self.library.as_mut().ok_or("no catalog is open")?;
+        let mut layout = library.layout();
+        layout.query = text.to_string();
+        layout.filters_off = false;
+        library.apply_layout(&layout);
+        Ok(serde_json::json!({"query": text}))
+    }
+    /// G: the Library's grid.
+    fn surface_library(&mut self) -> Result<serde_json::Value, String> {
+        if self.library.is_none() {
+            return Err("no catalog is open".into());
+        }
+        if !self.flush() {
+            return Err("an edit is still being saved".into());
+        }
+        self.library_mode = true;
+        if let Some(library) = &mut self.library {
+            library.show_grid();
+        }
+        Ok(serde_json::json!({}))
+    }
+    /// D: Develop on the selected photo, or the first one shown.
+    fn surface_develop(&mut self) -> Result<serde_json::Value, String> {
+        if !self.library_mode {
+            return Ok(serde_json::json!({}));
+        }
+        let library = self.library.as_mut().ok_or("no catalog is open")?;
+        let id = library
+            .selected_or_first()
+            .ok_or("the Library shows no photo to open")?;
+        self.surface_develop_photo(id)
+    }
+    fn surface_open(&mut self, target: &Target) -> Result<serde_json::Value, String> {
+        let library = self.library.as_mut().ok_or("no catalog is open")?;
+        let id = match target {
+            Target::Id(id) => library
+                .photo(*id)
+                .map(|p| p.id)
+                .ok_or_else(|| format!("no photo has id {id}"))?,
+            Target::Name(name) => match find_photos(&library.photos, name)[..] {
+                [] => return Err(format!("no photo matches \"{name}\"")),
+                [p] => p.id,
+                ref many => {
+                    let list: Vec<String> = many
+                        .iter()
+                        .take(10)
+                        .map(|p| format!("{} {} ({})", p.id, p.filename, p.path.display()))
+                        .collect();
+                    return Err(format!(
+                        "{} photos match \"{name}\"; open one with --id: {}",
+                        many.len(),
+                        list.join("; ")
+                    ));
+                }
+            },
+        };
+        // Leaves a filter that hides it, as clicking it elsewhere would.
+        library.reveal(id);
+        self.surface_develop_photo(id)
+    }
+    fn surface_develop_photo(&mut self, id: i64) -> Result<serde_json::Value, String> {
+        self.develop_catalog_photo(id);
+        if self.library_mode {
+            return Err(match &self.not_editable {
+                Some((_, reason)) => reason.clone(),
+                None => "RAWmakase is busy or has an edit to save first".into(),
+            });
+        }
+        let photo = self.library.as_ref().and_then(|l| l.photo(id));
+        Ok(
+            serde_json::json!({"opened": photo.map(|p| serde_json::json!({
+                "id": p.id,
+                "filename": p.filename,
+                "path": p.path.display().to_string(),
+            }))}),
+        )
     }
     fn apply_edits(&mut self, ctx: &egui::Context) {
         let pending = std::mem::take(&mut self.surface.pending);
@@ -761,7 +920,8 @@ impl Editor {
         }
     }
     /// Tells the control socket what the app looks like now, if it asked.
-    fn surface_publish(&self) {
+    fn surface_publish(&mut self) {
+        let result = self.surface.result.take();
         let surface = &self.surface;
         surface.shared.publish(surface.consumed, || {
             let develop = !self.library_mode && self.document.metadata.is_some();
@@ -789,7 +949,10 @@ impl Editor {
                 "photo": develop.then(|| self.document.path.as_ref().map(|p| p.display().to_string())).flatten(),
                 "black_and_white": develop && recipe.effects.monochrome,
                 "mixer_channel": mixer_channel,
+                "photo_id": develop.then_some(self.document.catalog_photo).flatten(),
+                "loaded": develop && self.document.full().is_some() && !self.load.is_running(),
                 "values": values,
+                "result": result,
             })
         });
     }
@@ -905,6 +1068,52 @@ mod tests {
         assert_eq!(surface.photo_step(), 1);
         assert_eq!(surface.photo_step(), 1);
         assert_eq!(surface.photo_step(), 0);
+    }
+
+    fn photo(id: i64, path: &str, master: Option<i64>) -> Photo {
+        let path = std::path::PathBuf::from(path);
+        Photo {
+            id,
+            folder: 1,
+            filename: path.file_name().unwrap().to_string_lossy().into_owned(),
+            path,
+            captured: String::new(),
+            rating: 0,
+            flag: 0,
+            label: String::new(),
+            format: "RAF".into(),
+            copy_name: String::new(),
+            master,
+            keywords: String::new(),
+            has_lightroom_edits: false,
+        }
+    }
+    fn ids(photos: Vec<&Photo>) -> Vec<i64> {
+        photos.into_iter().map(|p| p.id).collect()
+    }
+
+    #[test]
+    fn photos_are_found_by_name() {
+        let photos = [
+            photo(1, "/a/DSCF0042.RAF", None),
+            photo(2, "/a/DSCF0042.RAF", Some(1)),
+            photo(3, "/a/DSCF0043.RAF", None),
+            photo(4, "/b/DSCF0042.RAF", None),
+            photo(5, "/b/portrait.jpg", None),
+        ];
+        // Case, extension and stem; a master wins over its copy.
+        assert_eq!(ids(find_photos(&photos, "dscf0043")), [3]);
+        assert_eq!(ids(find_photos(&photos, "PORTRAIT.JPG")), [5]);
+        assert_eq!(ids(find_photos(&photos, "portrait")), [5]);
+        // The same name in two folders is ambiguous, but copies are not extra.
+        assert_eq!(ids(find_photos(&photos, "DSCF0042")), [1, 4]);
+        // A path picks one.
+        assert_eq!(ids(find_photos(&photos, "/b/dscf0042.raf")), [4]);
+        // Else a part of the name, if it fits.
+        assert_eq!(ids(find_photos(&photos, "0043")), [3]);
+        assert_eq!(ids(find_photos(&photos, "dscf")), [1, 3, 4]);
+        assert!(find_photos(&photos, "nothing").is_empty());
+        assert!(find_photos(&photos, "  ").is_empty());
     }
 
     #[test]

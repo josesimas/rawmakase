@@ -12,8 +12,11 @@
 //! {"ok": true, "state": {"mode": "develop", "values": {"exposure": 0.1, ...}}}
 //! ```
 //!
+//! Commands that act on the Library (`open`, `search`, `module`) put their outcome
+//! in `state.result`: `{"ok": false, "error": "..."}` when they fail.
+//!
 //! A reply is sent once a frame has handled the command, with the state after it.
-use super::{Action, Msg, Param, parse_action};
+use super::{Action, Job, Msg, Param, Target, parse_action};
 use eframe::egui;
 use serde_json::{Value, json};
 use std::{
@@ -128,6 +131,20 @@ fn command(request: &Value) -> Result<Vec<Msg>, String> {
                 None => return Err(format!("unknown action \"{name}\"")),
             }
         }
+        "open" => {
+            let target = match (request["id"].as_i64(), request["name"].as_str()) {
+                (Some(id), _) => Target::Id(id),
+                (None, Some(name)) => Target::Name(name.into()),
+                _ => return Err("\"name\" or \"id\" is missing".into()),
+            };
+            vec![Msg::Job(Job::Open(target))]
+        }
+        "search" => vec![Msg::Job(Job::Search(text("text")?.into()))],
+        "module" => match text("module")? {
+            "develop" => vec![Msg::Job(Job::Module(true))],
+            "library" => vec![Msg::Job(Job::Module(false))],
+            other => return Err(format!("\"module\" is develop or library, not \"{other}\"")),
+        },
         "photo" => match number("step")? as i32 {
             step @ (-1 | 1) => vec![Msg::Photo(step)],
             _ => return Err("\"step\" is -1 or 1".into()),
@@ -265,6 +282,14 @@ mod tests {
         assert!(matches!(set[..], [Msg::Set(Param::Hsl(2, 1), v)] if v == 20.));
         let key = parsed(r#"{"cmd":"action","action":"cmd+shift+z"}"#).unwrap();
         assert!(matches!(key[..], [Msg::Action(Action::Key(..))]));
+        let open = parsed(r#"{"cmd":"open","name":"DSCF0042"}"#).unwrap();
+        assert!(matches!(&open[..], [Msg::Job(Job::Open(Target::Name(n)))] if n == "DSCF0042"));
+        let open = parsed(r#"{"cmd":"open","id":7}"#).unwrap();
+        assert!(matches!(open[..], [Msg::Job(Job::Open(Target::Id(7)))]));
+        let search = parsed(r#"{"cmd":"search","text":""}"#).unwrap();
+        assert!(matches!(&search[..], [Msg::Job(Job::Search(t))] if t.is_empty()));
+        let module = parsed(r#"{"cmd":"module","module":"develop"}"#).unwrap();
+        assert!(matches!(module[..], [Msg::Job(Job::Module(true))]));
         let photo = parsed(r#"{"cmd":"photo","step":-1}"#).unwrap();
         assert!(matches!(photo[..], [Msg::Photo(-1)]));
     }
@@ -285,6 +310,8 @@ mod tests {
             (r#"{"cmd":"action","action":"hold:shift"}"#, "not an action"),
             (r#"{"cmd":"action","action":"nonsense"}"#, "unknown action"),
             (r#"{"cmd":"photo","step":5}"#, "-1 or 1"),
+            (r#"{"cmd":"open"}"#, "\"name\" or \"id\""),
+            (r#"{"cmd":"module","module":"grid"}"#, "develop or library"),
             (r#"{"cmd":"dance"}"#, "unknown command"),
             (r#"{}"#, "\"cmd\""),
         ] {

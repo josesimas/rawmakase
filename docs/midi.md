@@ -104,6 +104,11 @@ rawmakase-ctl key cmd+shift+z                 # a key, as the keyboard would
 rawmakase-ctl mixer sat                       # what the band faders then turn
 rawmakase-ctl bw                              # Black & White on / off
 rawmakase-ctl photo next                      # or prev
+rawmakase-ctl search "DSCF04"                 # the Library's search box; no text clears it
+rawmakase-ctl open DSCF0042                   # open a photo in Develop by name
+rawmakase-ctl open --id 17                    # ... or by catalog id
+rawmakase-ctl develop                         # Develop on the selected (or first) photo
+rawmakase-ctl library                         # back to the grid
 rawmakase-ctl controls                        # the Loupedeck's names
 rawmakase-ctl --state set tint 10             # print the state after any command
 ```
@@ -117,6 +122,18 @@ The tool finds the app's data folder as the app does (`RAWMAKASE_DATA_DIR`, or
   state after it. A minimized or fully hidden window draws no frames: the tool
   then fails after three seconds, and the command is still carried out when the
   window comes back.
+- `open` takes a filename in any case, with or without its extension, or a path
+  (any part of it, if it contains a `/`); failing that, a part of a filename that
+  only one photo has. A master wins over its virtual copies. When several photos
+  match, nothing opens and the error lists them with their ids for `--id`. A photo
+  hidden by the Library's filters is shown first, as clicking it elsewhere would.
+  `open` returns once the photo has loaded (`--no-wait` returns at once, and
+  `--timeout` sets how long to wait, 30 s). Edits sent to a photo that is still
+  loading are dropped, hence the wait. Photos the app refuses to open in Develop
+  fail with the reason the app gives.
+- `search` uses the same box and rules as the Library's own search (filename,
+  keywords, capture date, label) and switches the filters on if Cmd+L had turned
+  them off. It does not change the module.
 - Sliders change only with a photo open in Develop. `set` makes a History step of
   its own; `turn` and `dial` merge as a dial does.
 - `photo next` moves exactly one photo, even right after another; the photo loads
@@ -124,7 +141,10 @@ The tool finds the app's data folder as the app does (`RAWMAKASE_DATA_DIR`, or
 - The request format is one line of JSON each way, if you would rather not use the
   tool: `{"token": "...", "cmd": "turn", "param": "exposure", "ticks": 5}`, answered
   by `{"ok": true, "state": {...}}`. Commands: `state`, `cc`, `note`, `turn`, `set`,
-  `action`, `photo`.
+  `action`, `photo`, `open` (`name` or `id`), `search` (`text`) and `module`
+  (`develop` or `library`). The state has `mode`, `photo`, `photo_id`, `loaded`, the
+  slider `values`, and for Library commands a `result` with `ok` and an `error`
+  or what was opened.
 
 ## Mapping another device
 

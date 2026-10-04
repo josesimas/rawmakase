@@ -10,7 +10,7 @@ use std::{
     net::{Ipv4Addr, TcpStream},
     path::PathBuf,
     process::ExitCode,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// `println!` that ends quietly when the reader has gone, as with `| head`.
@@ -74,6 +74,26 @@ enum Command {
     Bw,
     /// Go to the next or previous photo in Develop and the Loupe
     Photo { direction: Direction },
+    /// Open a photo in Develop by filename (with or without extension), by
+    /// path, or by part of the name if only one photo has it
+    Open {
+        name: String,
+        /// `name` is the photo's catalog id, as an ambiguous match lists them
+        #[arg(long)]
+        id: bool,
+        /// Return as soon as the photo is opening, not when it has loaded
+        #[arg(long)]
+        no_wait: bool,
+        /// Seconds to wait for the photo to load
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+    },
+    /// Search the Library (filename, keyword, date or label); no text clears it
+    Search { text: Option<String> },
+    /// Switch to the Library grid
+    Library,
+    /// Switch to Develop, on the selected photo or the first one shown
+    Develop,
     /// List the Loupedeck's dial and button names
     Controls,
 }
@@ -259,6 +279,21 @@ fn requests(command: &Command) -> Result<Vec<Value>, String> {
             vec![json!({"cmd": "action", "action": format!("mixer:{channel}")})]
         }
         Command::Bw => vec![json!({"cmd": "action", "action": "toggle:bw"})],
+        Command::Open { name, id, .. } => {
+            if *id {
+                let id: i64 = name
+                    .parse()
+                    .map_err(|_| format!("\"{name}\" is not an id"))?;
+                vec![json!({"cmd": "open", "id": id})]
+            } else {
+                vec![json!({"cmd": "open", "name": name})]
+            }
+        }
+        Command::Search { text } => {
+            vec![json!({"cmd": "search", "text": text.clone().unwrap_or_default()})]
+        }
+        Command::Library => vec![json!({"cmd": "module", "module": "library"})],
+        Command::Develop => vec![json!({"cmd": "module", "module": "develop"})],
         Command::Photo { direction } => {
             let step = match direction {
                 Direction::Next => 1,
@@ -267,6 +302,21 @@ fn requests(command: &Command) -> Result<Vec<Value>, String> {
             vec![json!({"cmd": "photo", "step": step})]
         }
     })
+}
+
+/// Waits until photo `id` is loaded in Develop, ready for edits.
+fn wait_loaded(connection: &Connection, id: Option<i64>, seconds: u64) -> Result<Value, String> {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    loop {
+        let state = connection.ask(json!({"cmd": "state"}))?;
+        if state["loaded"] == true && (id.is_none() || state["photo_id"].as_i64() == id) {
+            return Ok(state);
+        }
+        if Instant::now() > deadline {
+            return Err(format!("the photo had not loaded after {seconds} s"));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 fn run(cli: Cli) -> Result<(), String> {
@@ -286,6 +336,25 @@ fn run(cli: Cli) -> Result<(), String> {
     let mut state = Value::Null;
     for request in requests(&cli.command)? {
         state = connection.ask(request)?;
+        // A Library command that the app could not carry out.
+        if state["result"]["ok"] == false {
+            return Err(state["result"]["error"]
+                .as_str()
+                .unwrap_or("refused")
+                .into());
+        }
+    }
+    if let Command::Open {
+        no_wait: false,
+        timeout,
+        ..
+    } = &cli.command
+    {
+        state = wait_loaded(
+            &connection,
+            state["result"]["opened"]["id"].as_i64(),
+            *timeout,
+        )?;
     }
     match &cli.command {
         Command::State => out!("{}", serde_json::to_string_pretty(&state).unwrap()),
@@ -337,6 +406,38 @@ mod tests {
         assert_eq!(buttons.len(), 40);
         assert_eq!(find(&buttons, "P7"), Ok(86));
         assert_eq!(find(&buttons, "Undo"), Ok(95));
+    }
+
+    #[test]
+    fn library_commands_become_requests() {
+        let parse = |args: &[&str]| {
+            let mut all = vec!["rawmakase-ctl"];
+            all.extend_from_slice(args);
+            requests(&Cli::try_parse_from(all).unwrap().command).unwrap()
+        };
+        assert_eq!(
+            parse(&["open", "IMG_5636"]),
+            [json!({"cmd": "open", "name": "IMG_5636"})]
+        );
+        assert_eq!(
+            parse(&["open", "--id", "42"]),
+            [json!({"cmd": "open", "id": 42})]
+        );
+        assert_eq!(parse(&["search"]), [json!({"cmd": "search", "text": ""})]);
+        assert_eq!(
+            parse(&["search", "raf"]),
+            [json!({"cmd": "search", "text": "raf"})]
+        );
+        assert_eq!(
+            parse(&["develop"]),
+            [json!({"cmd": "module", "module": "develop"})]
+        );
+        assert_eq!(
+            parse(&["library"]),
+            [json!({"cmd": "module", "module": "library"})]
+        );
+        let bad = Cli::try_parse_from(["rawmakase-ctl", "open", "--id", "x"]).unwrap();
+        assert!(requests(&bad.command).is_err());
     }
 
     #[test]
