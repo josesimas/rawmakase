@@ -91,7 +91,10 @@ impl Editor {
         if let Some(left) = self.view.wheel.remaining() {
             ctx.request_repaint_after(left);
         }
-        let gesture = ctx.input(|i| i.pointer.primary_down()) || self.view.wheel.active();
+        // A dial turned on a control surface is one too.
+        let gesture = ctx.input(|i| i.pointer.primary_down())
+            || self.view.wheel.active()
+            || self.surface.turning();
         let edited = self
             .document
             .history

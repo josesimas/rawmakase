@@ -87,6 +87,8 @@ pub struct Editor {
     /// Preferences > Raw Defaults, ready to apply; shared with the loader and the
     /// Library's previews.
     raw_defaults: std::sync::Arc<crate::develop::defaults::DevelopDefaults>,
+    /// A MIDI control surface such as the Loupedeck+.
+    surface: control_surface::Surface,
 }
 impl Editor {
     pub fn new(
@@ -251,6 +253,7 @@ impl Editor {
             raw_defaults: std::sync::Arc::new(crate::develop::defaults::DevelopDefaults::load(
                 session.raw_defaults.clone(),
             )),
+            surface: control_surface::Surface::start(ctx),
         };
         app.reload_presets(ctx);
         // A catalog passed on the command line opens instead of the last one;
@@ -403,6 +406,7 @@ mod brush_scroll;
 mod bulk_import;
 mod catalog;
 mod clipping;
+mod control_surface;
 mod crop_tool;
 mod dialogs;
 mod export;
