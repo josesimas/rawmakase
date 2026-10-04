@@ -355,19 +355,28 @@ fn listen(port: String, tx: Sender<Msg>, ctx: egui::Context) {
     let spawned = std::thread::Builder::new()
         .name("midi".into())
         .spawn(move || {
-            let mut connected: Option<(String, MidiInputConnection<()>)> = None;
+            let mut connected: Option<(String, String, MidiInputConnection<()>)> = None;
+            let mut last = Instant::now();
             loop {
+                // A gap far beyond the poll interval means the Mac slept; the
+                // device comes back as a new endpoint behind the same name.
+                if last.elapsed() > Duration::from_secs(10) {
+                    connected = None;
+                }
+                last = Instant::now();
                 if let Ok(input) = MidiInput::new("RAWmakase") {
                     let ports = input.ports();
                     let named = |p: &midir::MidiInputPort| input.port_name(p).unwrap_or_default();
                     match &connected {
-                        Some((name, _)) if !ports.iter().any(|p| &named(p) == name) => {
+                        Some((name, id, _))
+                            if !ports.iter().any(|p| &named(p) == name && &p.id() == id) =>
+                        {
                             connected = None;
                         }
                         Some(_) => {}
                         None => {
                             if let Some(p) = ports.iter().find(|p| named(p).contains(&port)) {
-                                let name = named(p);
+                                let (name, id) = (named(p), p.id());
                                 let (tx, ctx) = (tx.clone(), ctx.clone());
                                 connected = input
                                     .connect(
@@ -382,7 +391,7 @@ fn listen(port: String, tx: Sender<Msg>, ctx: egui::Context) {
                                         (),
                                     )
                                     .ok()
-                                    .map(|c| (name, c));
+                                    .map(|c| (name, id, c));
                             }
                         }
                     }
