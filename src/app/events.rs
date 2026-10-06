@@ -245,6 +245,9 @@ impl Editor {
                     self.undo_log.clear();
                 }
                 l.set_defaults(self.raw_defaults.clone());
+                if self.session_file.is_some() {
+                    remember_catalog_kind(&l.catalog);
+                }
                 self.library = Some(l);
                 self.library_mode = true;
                 // On launch, return to the folder, photo and module of last time.
@@ -358,5 +361,22 @@ impl Editor {
             return;
         };
         library.update_edited(ctx, id, small, json);
+    }
+}
+
+/// Records which kind of catalog is open, so the next launch and the
+/// Preferences choice follow it.
+fn remember_catalog_kind(catalog: &crate::catalog::Catalog) {
+    use crate::catalog::server::{Mode, Settings};
+    let mut settings = Settings::load();
+    let before = settings.clone();
+    if catalog.is_server() {
+        settings.mode = Mode::Server;
+    } else {
+        settings.mode = Mode::Local;
+        settings.last_local = Some(catalog.path.clone());
+    }
+    if settings != before {
+        let _ = settings.save();
     }
 }

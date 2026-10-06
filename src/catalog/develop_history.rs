@@ -3,10 +3,10 @@
 //! state it leaves, with large settings (camera profile, masks, spots, curves) stored
 //! once per History and referred to from every step that has them.
 use super::Catalog;
+use super::db::params;
 use crate::develop::Recipe;
 use anyhow::{Context, Result, ensure};
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
-use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::io::Read;
@@ -188,29 +188,25 @@ impl Catalog {
     /// The photo's saved Develop History. `None` without one, or when it cannot be
     /// read (from a newer release, or damaged): the edit itself stays usable.
     pub fn load_history(&self, id: i64) -> Result<Option<SavedHistory>> {
-        let data: Option<Vec<u8>> = self
-            .db
-            .query_row(
-                "SELECT data FROM develop_history WHERE photo=?",
-                [id],
-                |r| r.get(0),
-            )
-            .optional()?;
+        let data: Option<Vec<u8>> = self.db.query_opt(
+            "SELECT data FROM develop_history WHERE photo=?",
+            [id],
+            |r| r.get(0),
+        )?;
         Ok(data.and_then(|d| SavedHistory::decode(&d).ok().flatten()))
     }
     /// Whether the photo has a stored History, readable here or not.
     pub fn has_history(&self, id: i64) -> Result<bool> {
         Ok(self
             .db
-            .query_row("SELECT 1 FROM develop_history WHERE photo=?", [id], |_| {
+            .query_opt("SELECT 1 FROM develop_history WHERE photo=?", [id], |_| {
                 Ok(())
-            })
-            .optional()?
+            })?
             .is_some())
     }
     /// Stores `history` for the photo inside the transaction saving its edit.
     pub(super) fn put_history(
-        tx: &rusqlite::Transaction<'_>,
+        tx: &super::db::Db,
         id: i64,
         history: HistoryUpdate<'_>,
     ) -> Result<()> {
@@ -222,7 +218,8 @@ impl Catalog {
             }
             HistoryUpdate::Replace(h) => {
                 tx.execute(
-                    "INSERT OR REPLACE INTO develop_history(photo, data) VALUES (?, ?)",
+                    "INSERT INTO develop_history(photo, data) VALUES (?, ?)
+                     ON CONFLICT(photo) DO UPDATE SET data=excluded.data",
                     params![id, h.encode()?],
                 )?;
             }

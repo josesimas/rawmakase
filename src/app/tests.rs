@@ -3026,3 +3026,48 @@ fn converting_while_the_photo_decodes_waits_for_its_auto_mix() {
     in_edit_frame(&ctx, &mut editor, Editor::finish_pending_treatment);
     assert!(!editor.document.recipe.effects.monochrome);
 }
+#[test]
+fn preferences_choose_between_a_local_and_a_server_catalog() {
+    use crate::catalog::server::{Mode, ServerConfig};
+    let ctx = egui::Context::default();
+    let mut e = Editor::with_context(&ctx, None, crate::storage::Session::default(), None);
+    e.open_preferences(super::preferences::Tab::Catalog);
+    let frame = |e: &mut Editor| {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200., 900.))),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| e.draw(ui));
+        output.textures_delta.clear();
+        output
+    };
+    let text = |output: &egui::FullOutput| {
+        output
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    e.onboarding_done = true;
+    e.preferences.catalog_source.mode = Mode::Local;
+    // The window takes a frame to lay out.
+    frame(&mut e);
+    let shown = text(&frame(&mut e));
+    assert!(shown.contains("Local Catalog") && shown.contains("Server Catalog"));
+    assert!(!shown.contains("Test Connection"));
+    e.preferences.catalog_source.mode = Mode::Server;
+    e.preferences.catalog_source.server = ServerConfig {
+        host: "db.local".into(),
+        database: "Catalog".into(),
+        user: "ana".into(),
+        ..Default::default()
+    };
+    frame(&mut e);
+    let shown = text(&frame(&mut e));
+    assert!(shown.contains("Test Connection") && shown.contains("Connect"));
+    assert!(shown.contains("Password") && shown.contains("Database"));
+}

@@ -3,13 +3,13 @@
 //! Metadata from Files, for photos already in the catalog. Never at render
 //! time; the catalog stays the source of truth.
 use super::Catalog;
+use super::db::{Db, params};
 use crate::jpeg::{APP1, Segments};
 use crate::xmp::{
     descriptive::{self, Read},
     ns::JPEG_HEADER,
 };
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
 use std::path::{Path, PathBuf};
 
 /// What reading sidecars found besides the metadata.
@@ -203,7 +203,7 @@ pub enum Merge {
 
 /// Writes what was read into photo `id`'s rows, in `db`'s transaction, as
 /// `merge` says. Rating, label and flag are set where the file has them.
-pub(super) fn apply(db: &Connection, id: i64, read: &Read, merge: Merge) -> Result<()> {
+pub(super) fn apply(db: &Db, id: i64, read: &Read, merge: Merge) -> Result<()> {
     let overwrite = merge == Merge::Overwrite;
     let mut d = super::descriptive::read(db, id)?;
     fn put<T: Clone>(slot: &mut Option<T>, value: &Option<T>, overwrite: bool) {
@@ -262,7 +262,7 @@ impl Catalog {
         merge: Merge,
     ) -> Result<SidecarReport> {
         let mut report = SidecarReport::default();
-        let mut tx = self.db.transaction()?;
+        let tx = self.db.transaction()?;
         for (id, path, read) in reads {
             let sp = tx.savepoint()?;
             match apply(&sp, *id, read, merge) {
@@ -300,12 +300,12 @@ impl Catalog {
 /// a Lightroom catalog keeps per photo (attached as `lr`), for the photos
 /// that have no row yet. Keywords, rating, label and flag come from
 /// Lightroom's own tables. Returns the photos read.
-pub(super) fn copy_lightroom_metadata(db: &Connection) -> Result<usize> {
+pub(super) fn copy_lightroom_metadata(db: &Db) -> Result<usize> {
     if !super::lightroom::has_table(db, "lr", "Adobe_AdditionalMetadata")? {
         return Ok(0);
     }
-    let rows: Vec<(i64, String)> = db
-        .prepare(&format!(
+    let rows: Vec<(i64, String)> = db.query_all(
+        &format!(
             // Only photos that are still that Lightroom image: a photo
             // added since may have taken a removed copy's id.
             "SELECT m.image, m.xmp FROM lr.Adobe_AdditionalMetadata m
@@ -316,18 +316,17 @@ pub(super) fn copy_lightroom_metadata(db: &Connection) -> Result<usize> {
              JOIN lr.AgLibraryRootFolder r ON r.id_local = d.rootFolder
              WHERE p.original_path = r.absolutePath || d.pathFromRoot || {}",
             super::lightroom::LIGHTROOM_FILENAME
-        ))?
-        .query_map([], |r| {
-            let xmp = match r.get_ref(1)? {
-                rusqlite::types::ValueRef::Text(t) | rusqlite::types::ValueRef::Blob(t) => {
-                    // Invalid text is left out rather than imported mangled.
-                    String::from_utf8(t.to_vec()).unwrap_or_default()
-                }
-                _ => String::new(),
+        ),
+        (),
+        |r| {
+            // Invalid text is left out rather than imported mangled.
+            let xmp = match r.get::<Option<Vec<u8>>>(1)? {
+                Some(t) => String::from_utf8(t).unwrap_or_default(),
+                None => String::new(),
             };
             Ok((r.get(0)?, xmp))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
+        },
+    )?;
     let mut read = 0;
     for (id, xmp) in rows {
         // A packet that can't be read is left out, as Lightroom's own data.

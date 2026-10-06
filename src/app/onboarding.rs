@@ -214,11 +214,7 @@ impl Editor {
         let catalog = self.library.as_ref().map(|l| {
             format!(
                 "{} · {} photos",
-                l.catalog
-                    .path
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy(),
+                crate::catalog::server::display_name(&l.catalog.path),
                 l.photos.len()
             )
         });

@@ -1,7 +1,8 @@
 use super::lightroom::{develop_fields, import_lightroom};
 use super::*;
 use crate::{develop::Recipe, export::ExportOptions, storage::Identity};
-fn fixture(path: &Path) -> Result<()> {
+use rusqlite::params;
+pub(super) fn fixture(path: &Path) -> Result<()> {
     let db = Connection::open(path)?;
     db.execute_batch("CREATE TABLE AgLibraryRootFolder(id_local INTEGER, absolutePath TEXT);
         CREATE TABLE AgLibraryFolder(id_local INTEGER,rootFolder INTEGER,pathFromRoot TEXT);
@@ -110,9 +111,9 @@ fn import_is_lossless_atomic_and_virtual_copies_are_independent() -> Result<()> 
     assert_eq!(identity, Identity::read(&source)?);
     assert_eq!(bytes, std::fs::read(&source)?);
     let mut cat = Catalog::open(&output)?;
-    let archive: Vec<u8> = cat
-        .db
-        .query_row("SELECT original_catalog FROM sources", [], |r| r.get(0))?;
+    let archive: Vec<u8> =
+        cat.db_for_tests()
+            .query_row("SELECT original_catalog FROM sources", [], |r| r.get(0))?;
     assert_eq!(archive, bytes);
     let photos = cat.photos()?;
     assert_eq!(photos.len(), 2);
@@ -187,7 +188,8 @@ fn bad_imports_leave_no_destination_and_future_catalogs_are_rejected() -> Result
     assert!(import_lightroom(&source, &dest).is_err());
     assert!(!dest.exists());
     let cat = Catalog::create(&dest)?;
-    cat.db.execute_batch("PRAGMA user_version=999")?;
+    cat.db_for_tests()
+        .execute_batch("PRAGMA user_version=999")?;
     drop(cat);
     assert!(Catalog::open(&dest).is_err());
     Ok(())
@@ -577,9 +579,10 @@ fn catalog_keeps_spots_and_masks_out_of_the_recipe_column() -> Result<()> {
     let edited = c.edit_stamp(id)?;
     assert_ne!(edited, unedited);
     let column: String =
-        c.db.query_row("SELECT recipe FROM photos WHERE id=?", [id], |row| {
-            row.get(0)
-        })?;
+        c.db_for_tests()
+            .query_row("SELECT recipe FROM photos WHERE id=?", [id], |row| {
+                row.get(0)
+            })?;
     assert!(!column.contains("masks"));
     assert_eq!(c.load_edit(id, &photo)?.unwrap().recipe, r);
     let (text, _) = c.edit_texts(id)?;
@@ -633,13 +636,13 @@ fn lightroom_history_is_backfilled_once() -> Result<()> {
     // A stored Lightroom catalog from before history steps were kept.
     let original = d.path().join("original.lrcat");
     Connection::open(&original)?.execute_batch("CREATE TABLE Adobe_images(id_local INTEGER)")?;
-    cat.db.execute(
+    cat.db_for_tests().execute(
         "INSERT INTO sources(path, original_size, original_catalog) VALUES ('x.lrcat', 0, ?)",
         [std::fs::read(&original)?],
     )?;
     assert_eq!(cat.backfill_lightroom_history()?, 0);
     // Reading it again would now fail: it is not read again, on this or a later open.
-    cat.db
+    cat.db_for_tests()
         .execute("UPDATE sources SET original_catalog=randomblob(4096)", [])?;
     assert_eq!(cat.backfill_lightroom_history()?, 0);
     drop(cat);
@@ -668,7 +671,7 @@ fn virtual_copies_are_created_promoted_renamed_and_removed() -> Result<()> {
         &ExportOptions::default(),
         crate::catalog::HistoryUpdate::Keep,
     )?;
-    cat.db.execute_batch(&format!(
+    cat.db_for_tests().execute_batch(&format!(
         "INSERT INTO keywords(id,name) VALUES(1,'City');
          INSERT INTO photo_keywords VALUES({},1);",
         original.id
@@ -826,7 +829,7 @@ fn photo_info_formats_as_lightroom_shows_it() {
 fn edit_times_come_from_rawmakase_or_else_lightroom_history() -> Result<()> {
     let d = tempfile::tempdir()?;
     let c = Catalog::create(&d.path().join("c.rawmakase"))?;
-    c.db.execute_batch(
+    c.db_for_tests().execute_batch(
         "PRAGMA foreign_keys = OFF;
          INSERT INTO photos(id, folder, filename, original_path) VALUES
              (1, 1, 'a.RAF', 'a.RAF'), (2, 1, 'b.RAF', 'b.RAF'), (3, 1, 'c.RAF', 'c.RAF');
@@ -941,7 +944,7 @@ fn reopening_a_catalog_adds_the_tables_a_newer_release_needs() -> Result<()> {
     // Opening runs the schema again, which is what has to fill them in.
     let cat = Catalog::open(&dest)?;
     let present: Vec<String> = cat
-        .db
+        .db_for_tests()
         .prepare(
             "SELECT name FROM sqlite_master WHERE type='table' AND name IN
          ('local_edits','bitmaps','lightroom_history') ORDER BY name",
@@ -1044,7 +1047,7 @@ fn lightroom_keyword_export_options_are_imported_and_backfilled() -> Result<()> 
     ];
     assert_eq!(exported(&cat)?, expected);
     // A catalog imported before the options were kept gets them once.
-    cat.db.execute_batch(
+    cat.db_for_tests().execute_batch(
         "DELETE FROM keyword_export;
          DELETE FROM meta WHERE key='lightroom_keyword_export_backfilled';",
     )?;
@@ -1092,7 +1095,7 @@ fn develop_history_saves_with_the_edit_and_goes_with_the_photo() -> Result<()> {
     c.save_edit(id, &photo, &Recipe::default(), &export, HistoryUpdate::Keep)?;
     assert_eq!(c.load_history(id)?, Some(history.clone()));
     // A History from a newer release is left unread, not misread.
-    c.db.execute(
+    c.db_for_tests().execute(
         "UPDATE develop_history SET data=? WHERE photo=?",
         rusqlite::params![
             {
@@ -1113,7 +1116,8 @@ fn develop_history_saves_with_the_edit_and_goes_with_the_photo() -> Result<()> {
     };
     c.save_edit(id, &photo, &edited, &export, empty.update())?;
     let count = |c: &Catalog| -> Result<i64> {
-        Ok(c.db.query_row("SELECT COUNT(*) FROM develop_history", [], |r| r.get(0))?)
+        Ok(c.db_for_tests()
+            .query_row("SELECT COUNT(*) FROM develop_history", [], |r| r.get(0))?)
     };
     assert_eq!(count(&c)?, 1);
     c.save_edit(
@@ -1131,7 +1135,8 @@ fn develop_history_saves_with_the_edit_and_goes_with_the_photo() -> Result<()> {
     c.remove_virtual_copy(copy)?;
     assert_eq!(count(&c)?, 1);
     // Removing the photo removes its History.
-    c.db.execute("DELETE FROM photos WHERE id=?", [id])?;
+    c.db_for_tests()
+        .execute("DELETE FROM photos WHERE id=?", [id])?;
     assert_eq!(count(&c)?, 0);
     Ok(())
 }
@@ -1279,7 +1284,8 @@ fn snapshots_are_named_states_kept_per_photo_and_listed_alphabetically() -> Resu
     c.add_snapshot(copy, "Copy look", &warm)?;
     c.remove_virtual_copy(copy)?;
     let left: i64 =
-        c.db.query_row("SELECT COUNT(*) FROM develop_snapshots", [], |r| r.get(0))?;
+        c.db_for_tests()
+            .query_row("SELECT COUNT(*) FROM develop_snapshots", [], |r| r.get(0))?;
     assert_eq!(left, 1);
     Ok(())
 }
@@ -1311,8 +1317,9 @@ fn lightroom_snapshots_import_with_their_photo() -> Result<()> {
         SnapshotSettings::Lightroom("s = { Exposure2012 = 0.5 }".into())
     );
     // A catalog imported before snapshots were kept recovers them once.
-    cat.db.execute("DELETE FROM develop_snapshots", [])?;
-    cat.db.execute(
+    cat.db_for_tests()
+        .execute("DELETE FROM develop_snapshots", [])?;
+    cat.db_for_tests().execute(
         "DELETE FROM meta WHERE key='lightroom_snapshots_backfilled'",
         [],
     )?;
@@ -1320,7 +1327,7 @@ fn lightroom_snapshots_import_with_their_photo() -> Result<()> {
     assert_eq!(cat.snapshots(40)?.len(), 1);
     assert_eq!(cat.backfill_lightroom_snapshots()?, 0);
     // A copy cut short before its marker was written copies nothing twice.
-    cat.db.execute(
+    cat.db_for_tests().execute(
         "DELETE FROM meta WHERE key='lightroom_snapshots_backfilled'",
         [],
     )?;

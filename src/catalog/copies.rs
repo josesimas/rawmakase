@@ -1,8 +1,8 @@
 //! Lightroom's virtual copies: photos of the same file with their own edit,
 //! metadata and name.
 use super::Catalog;
+use super::db::params;
 use anyhow::{Context, Result, ensure};
-use rusqlite::{OptionalExtension, params};
 
 impl Catalog {
     /// Lightroom's Create Virtual Copy: a new photo of the same file with the
@@ -11,35 +11,35 @@ impl Catalog {
     pub fn create_virtual_copy(&mut self, id: i64) -> Result<i64> {
         let master: i64 = self
             .db
-            .query_row(
+            .query_opt(
                 "SELECT COALESCE(master_id, id) FROM photos WHERE id=?",
                 [id],
                 |r| r.get(0),
-            )
-            .optional()?
+            )?
             .context("Unknown photo")?;
         let name = self.unused_copy_name(master)?;
         let tx = self.db.transaction()?;
-        tx.execute(
+        // CAST: PostgreSQL does not give a parameter in a SELECT list the
+        // type of the column it is inserted into.
+        let copy = tx.insert(
             "INSERT INTO photos(folder,filename,original_path,captured,rating,flag,label,format,
                 copy_name,master_id,orientation,lightroom_develop,recipe,export_options,identity,edited_at)
              SELECT folder,filename,original_path,captured,rating,flag,label,format,
-                ?,?,orientation,lightroom_develop,recipe,export_options,identity,edited_at
-             FROM photos WHERE id=?",
+                CAST(? AS TEXT),CAST(? AS BIGINT),orientation,lightroom_develop,recipe,export_options,identity,edited_at
+             FROM photos WHERE id=? RETURNING id",
             params![name, master, id],
         )?;
-        let copy = tx.last_insert_rowid();
         tx.execute(
-            "INSERT INTO local_edits(photo,data) SELECT ?,data FROM local_edits WHERE photo=?",
+            "INSERT INTO local_edits(photo,data) SELECT CAST(? AS BIGINT),data FROM local_edits WHERE photo=?",
             [copy, id],
         )?;
         // The copy starts with the History of the edit it copies, then goes its own way.
         tx.execute(
-            "INSERT INTO develop_history(photo,data) SELECT ?,data FROM develop_history WHERE photo=?",
+            "INSERT INTO develop_history(photo,data) SELECT CAST(? AS BIGINT),data FROM develop_history WHERE photo=?",
             [copy, id],
         )?;
         tx.execute(
-            "INSERT INTO photo_keywords(photo,keyword) SELECT ?,keyword FROM photo_keywords WHERE photo=?",
+            "INSERT INTO photo_keywords(photo,keyword) SELECT CAST(? AS BIGINT),keyword FROM photo_keywords WHERE photo=?",
             [copy, id],
         )?;
         super::descriptive::copy_rows(&tx, id, copy)?;
@@ -50,9 +50,13 @@ impl Catalog {
     fn unused_copy_name(&self, master: i64) -> Result<String> {
         let names: std::collections::HashSet<String> = self
             .db
-            .prepare("SELECT copy_name FROM photos WHERE master_id=?")?
-            .query_map([master], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
+            .query_all(
+                "SELECT copy_name FROM photos WHERE master_id=?",
+                [master],
+                |r| r.get(0),
+            )?
+            .into_iter()
+            .collect();
         Ok((1..)
             .map(|n| format!("Copy {n}"))
             .find(|name| !names.contains(name))
@@ -60,10 +64,9 @@ impl Catalog {
     }
     fn master_of(&self, id: i64) -> Result<Option<i64>> {
         self.db
-            .query_row("SELECT master_id FROM photos WHERE id=?", [id], |r| {
+            .query_opt("SELECT master_id FROM photos WHERE id=?", [id], |r| {
                 r.get(0)
-            })
-            .optional()?
+            })?
             .context("Unknown photo")
     }
     /// Lightroom's Set Copy as Master: the copy becomes the master, and the
@@ -93,9 +96,12 @@ impl Catalog {
         )?;
         // Photo info is kept by master; the new one takes it over.
         tx.execute(
-            "INSERT OR REPLACE INTO photo_info
-             SELECT ?1, camera, lens, focal, aperture, exposure, iso, width, height
-             FROM photo_info WHERE photo=?2",
+            "INSERT INTO photo_info
+             SELECT CAST(?1 AS BIGINT), camera, lens, focal, aperture, exposure, iso, width, height
+             FROM photo_info WHERE photo=?2
+             ON CONFLICT(photo) DO UPDATE SET camera=excluded.camera, lens=excluded.lens,
+                focal=excluded.focal, aperture=excluded.aperture, exposure=excluded.exposure,
+                iso=excluded.iso, width=excluded.width, height=excluded.height",
             [id, master],
         )?;
         tx.execute(

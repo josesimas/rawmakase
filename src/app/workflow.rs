@@ -7,9 +7,10 @@ use std::path::PathBuf;
 
 impl Editor {
     pub(super) fn open(&mut self, path: PathBuf) {
-        let catalog = path
-            .extension()
-            .is_some_and(|e| e == "rawmakase" || e == "lrcat");
+        let catalog = crate::catalog::server::is_location(&path)
+            || path
+                .extension()
+                .is_some_and(|e| e == "rawmakase" || e == "lrcat");
         if !catalog {
             // Photos are edited through the Library only.
             self.add_to_library(path);
@@ -18,7 +19,9 @@ impl Editor {
         if self.activity.is_busy() {
             return;
         }
-        if path.extension().is_some_and(|e| e == "rawmakase") {
+        if crate::catalog::server::is_location(&path)
+            || path.extension().is_some_and(|e| e == "rawmakase")
+        {
             self.load_catalog(path, &self.context.clone());
         } else if path.extension().is_some_and(|e| e == "lrcat") {
             self.status =

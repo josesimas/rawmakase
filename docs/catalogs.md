@@ -64,6 +64,21 @@ A `.rawmakase` file is SQLite with application ID `0x4f4d4152` and `PRAGMA user_
 
 Creation/import publish atomically without clobbering another file. SQLite transactions protect metadata and recipe writes. Back up the `.rawmakase` file with RAWmakase closed. No Lightroom file or RAW is modified by catalog operations.
 
+## Server catalog (PostgreSQL)
+
+The catalog can live in a PostgreSQL database instead of a file, so several computers share it. Open **Preferences → Catalog**, under **Catalog storage** choose **Local Catalog** (a `.rawmakase` file, as before) or **Server Catalog**. For a server enter its address and port, the database, user and password, then press **Test Connection** and **Connect**. RAWmakase uses the server catalog on every launch until you choose Local again or open a file catalog (**Open…**, **New…** or **Import Lightroom Catalog…** with Local Catalog chosen); the open catalog decides which choice is shown.
+
+The database must be empty, or already hold a RAWmakase catalog: the tables are created the first time it is opened, and a database with other tables is refused. Importing a Lightroom catalog with Server Catalog chosen builds it in a temporary file and copies it into the empty database in one transaction, keeping photo ids and the byte-exact `.lrcat` archive; **Copy a Local Catalog to the Server…** does the same for an existing `.rawmakase` file. A server catalog that already has photos is never merged into.
+
+The tables, columns and meaning are those of the SQLite format above; PostgreSQL stores integers as `BIGINT`, archives as `BYTEA`, and text in byte order (`COLLATE "C"`) so photos sort as they do locally. Its format and schema revision are in the `meta` table. What differs from a local catalog:
+
+- **Connection.** Host, port, database and user are saved in `catalog-server.json` in the app data folder, with the password, readable only by your account. The connection is not encrypted; use a trusted network or a tunnel. A connection the server dropped is replaced on the next action; a change that was being saved when it dropped fails instead of being half-saved.
+- **Speed.** Every query goes over the network. Browsing and editing work as locally on a fast LAN; selecting very many photos at once reads their metadata photo by photo.
+- **Photos and previews stay local.** Only the catalog is shared, not the photo files. Folder mappings (relinking) are stored in it too, so every computer must see the photos at the same paths. The preview cache and Develop's caches stay on each computer.
+- **One database, one catalog.** Use a separate database for each catalog. Back it up with `pg_dump`.
+
+The Lightroom backfills for catalogs imported by older releases do not apply: a server catalog is filled complete by its import.
+
 ## CLI
 
 ```sh

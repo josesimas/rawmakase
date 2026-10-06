@@ -1,8 +1,8 @@
 //! Adding a folder of photos to the catalog, with the edits they got from
 //! releases that saved them beside the photo.
 use super::Catalog;
+use super::db::params;
 use anyhow::Result;
-use rusqlite::{OptionalExtension, params};
 use std::path::{Path, PathBuf};
 
 impl Catalog {
@@ -47,22 +47,17 @@ impl Catalog {
         let existing_paths: std::collections::HashSet<_> =
             self.photos()?.into_iter().map(|p| p.path).collect();
         let tx = self.db.transaction()?;
-        let root: Option<i64> = tx
-            .query_row(
-                "SELECT id FROM roots WHERE original_path=?",
-                [folder.to_string_lossy()],
-                |r| r.get(0),
-            )
-            .optional()?;
+        let root: Option<i64> = tx.query_opt(
+            "SELECT id FROM roots WHERE original_path=?",
+            [folder.to_string_lossy()],
+            |r| r.get(0),
+        )?;
         let root = match root {
             Some(root) => root,
-            None => {
-                tx.execute(
-                    "INSERT INTO roots(original_path) VALUES(?)",
-                    [folder.to_string_lossy()],
-                )?;
-                tx.last_insert_rowid()
-            }
+            None => tx.insert(
+                "INSERT INTO roots(original_path) VALUES(?) RETURNING id",
+                [folder.to_string_lossy()],
+            )?,
         };
         let mut added = Vec::new();
         for file in files {
@@ -70,12 +65,11 @@ impl Catalog {
                 continue;
             }
             if tx
-                .query_row(
+                .query_opt(
                     "SELECT 1 FROM photos WHERE original_path=?",
                     [file.to_string_lossy()],
-                    |r| r.get::<_, i32>(0),
-                )
-                .optional()?
+                    |r| r.get::<i32>(0),
+                )?
                 .is_some()
             {
                 continue;
@@ -85,24 +79,21 @@ impl Catalog {
                 .unwrap()
                 .strip_prefix(&folder)?
                 .to_string_lossy();
-            let existing = tx
-                .query_row(
-                    "SELECT id FROM folders WHERE root=? AND relative_path=?",
-                    params![root, relative],
-                    |r| r.get::<_, i64>(0),
-                )
-                .optional()?;
+            let existing = tx.query_opt(
+                "SELECT id FROM folders WHERE root=? AND relative_path=?",
+                params![root, relative],
+                |r| r.get::<i64>(0),
+            )?;
             let fid = if let Some(id) = existing {
                 id
             } else {
-                tx.execute(
-                    "INSERT INTO folders(root,relative_path) VALUES(?,?)",
+                tx.insert(
+                    "INSERT INTO folders(root,relative_path) VALUES(?,?) RETURNING id",
                     params![root, relative],
-                )?;
-                tx.last_insert_rowid()
+                )?
             };
-            tx.execute(
-                "INSERT INTO photos(folder,filename,original_path,format) VALUES(?,?,?,?)",
+            let id = tx.insert(
+                "INSERT INTO photos(folder,filename,original_path,format) VALUES(?,?,?,?) RETURNING id",
                 params![
                     fid,
                     file.file_name().unwrap().to_string_lossy(),
@@ -113,7 +104,7 @@ impl Catalog {
                         .to_ascii_uppercase()
                 ],
             )?;
-            added.push((tx.last_insert_rowid(), file));
+            added.push((id, file));
         }
         tx.commit()?;
         for (id, file) in &added {
@@ -144,16 +135,16 @@ impl Catalog {
     /// photo's virtual copies get its date too.
     pub fn fill_capture_times(&mut self, times: &[(i64, String)]) -> Result<()> {
         let tx = self.db.transaction()?;
-        {
+        for (id, captured) in times {
             // Two statements, each on an index, rather than one OR that scans.
-            let mut photo =
-                tx.prepare("UPDATE photos SET captured=?1 WHERE id=?2 AND captured=''")?;
-            let mut copies =
-                tx.prepare("UPDATE photos SET captured=?1 WHERE master_id=?2 AND captured=''")?;
-            for (id, captured) in times {
-                photo.execute(params![captured, id])?;
-                copies.execute(params![captured, id])?;
-            }
+            tx.execute(
+                "UPDATE photos SET captured=?1 WHERE id=?2 AND captured=''",
+                params![captured, id],
+            )?;
+            tx.execute(
+                "UPDATE photos SET captured=?1 WHERE master_id=?2 AND captured=''",
+                params![captured, id],
+            )?;
         }
         tx.commit()?;
         Ok(())

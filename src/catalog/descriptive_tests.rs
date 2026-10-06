@@ -55,11 +55,11 @@ fn editing_the_default_language_keeps_the_others_and_clearing_drops_all() -> Res
     );
     cat.set_text(&ids, TextField::Title, "")?;
     assert_eq!(cat.descriptive(id)?.title, Some(Value::Cleared));
-    let left: i64 =
-        cat.db
-            .query_row("SELECT count(*) FROM photo_text WHERE photo=?", [id], |r| {
-                r.get(0)
-            })?;
+    let left: i64 = cat.db_for_tests().query_row(
+        "SELECT count(*) FROM photo_text WHERE photo=?",
+        [id],
+        |r| r.get(0),
+    )?;
     assert_eq!(left, 0);
     // Typing again sets just the default language.
     cat.set_text(&ids, TextField::Title, "Pier")?;
@@ -138,11 +138,11 @@ fn several_keywords_are_added_in_one_go() -> Result<()> {
             .is_err()
     );
     assert_eq!(cat.keywords(ids[0])?.len(), 2);
-    let made: i64 =
-        cat.db
-            .query_row("SELECT count(*) FROM keywords WHERE name='New'", [], |r| {
-                r.get(0)
-            })?;
+    let made: i64 = cat.db_for_tests().query_row(
+        "SELECT count(*) FROM keywords WHERE name='New'",
+        [],
+        |r| r.get(0),
+    )?;
     assert_eq!(made, 0);
     Ok(())
 }
@@ -238,7 +238,7 @@ fn virtual_copies_get_their_own_rows_and_lose_only_theirs() -> Result<()> {
     // Removing a copy (the former master now) removes only its rows.
     cat.remove_virtual_copy(master)?;
     for table in super::descriptive::TABLES {
-        let left: i64 = cat.db.query_row(
+        let left: i64 = cat.db_for_tests().query_row(
             &format!("SELECT count(*) FROM {table} WHERE photo=?"),
             [master],
             |r| r.get(0),
@@ -321,7 +321,7 @@ fn keywords_are_found_by_path_in_nfc_and_read_with_their_ancestors() -> Result<(
 #[test]
 fn keyword_lookup_uses_the_first_of_lightroom_duplicates() -> Result<()> {
     let (_dir, mut cat, _) = catalog(0)?;
-    cat.db.execute_batch(
+    cat.db_for_tests().execute_batch(
         "INSERT INTO keywords(id, name, parent) VALUES (7, 'Dup', NULL), (5, 'Dup', NULL);",
     )?;
     assert_eq!(cat.keyword_at(&["Dup".into()])?, 5);

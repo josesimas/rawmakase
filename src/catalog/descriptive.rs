@@ -4,8 +4,8 @@
 //! file's own (its EXIF, at export); a cleared one is empty whatever the file
 //! says.
 use super::Catalog;
+use super::db::{Db, params};
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashMap;
 use unicode_normalization::UnicodeNormalization;
 
@@ -228,16 +228,14 @@ impl Catalog {
                 Ok(MetadataSnapshot {
                     photo: *id,
                     descriptive: read(&self.db, *id)?,
-                    keywords: self
-                        .db
-                        .prepare_cached("SELECT keyword FROM photo_keywords WHERE photo=?")?
-                        .query_map([id], |r| r.get(0))?
-                        .collect::<rusqlite::Result<_>>()?,
+                    keywords: self.db.query_all(
+                        "SELECT keyword FROM photo_keywords WHERE photo=?",
+                        [id],
+                        |r| r.get(0),
+                    )?,
                     captured: self
                         .db
-                        .prepare_cached("SELECT captured FROM photos WHERE id=?")?
-                        .query_row([id], |r| r.get(0))
-                        .optional()?
+                        .query_opt("SELECT captured FROM photos WHERE id=?", [id], |r| r.get(0))?
                         .context("Unknown photo")?,
                 })
             })
@@ -268,11 +266,11 @@ impl Catalog {
     }
     /// A photo's keywords, each with its path from the top, by path.
     pub fn keywords(&self, id: i64) -> Result<Vec<Keyword>> {
-        let ids: Vec<i64> = self
-            .db
-            .prepare_cached("SELECT keyword FROM photo_keywords WHERE photo=?")?
-            .query_map([id], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
+        let ids: Vec<i64> = self.db.query_all(
+            "SELECT keyword FROM photo_keywords WHERE photo=?",
+            [id],
+            |r| r.get(0),
+        )?;
         let mut keywords = ids
             .into_iter()
             .map(|k| keyword(&self.db, k))
@@ -329,44 +327,42 @@ impl Catalog {
 }
 
 /// Gives `photo` `keyword`, unless it has it already.
-pub(super) fn tag_photo(db: &Connection, photo: i64, keyword: i64) -> Result<()> {
+pub(super) fn tag_photo(db: &Db, photo: i64, keyword: i64) -> Result<()> {
     db.execute(
-        "INSERT OR IGNORE INTO photo_keywords(photo, keyword) VALUES (?, ?)",
+        "INSERT INTO photo_keywords(photo, keyword) VALUES (?, ?) ON CONFLICT DO NOTHING",
         [photo, keyword],
     )?;
     Ok(())
 }
 
 /// The keyword at `path`, made where missing.
-pub(super) fn keyword_at(db: &Connection, path: &[String]) -> Result<i64> {
+pub(super) fn keyword_at(db: &Db, path: &[String]) -> Result<i64> {
     let mut parent: Option<i64> = None;
     for name in path {
         let name = keyword_name(name);
         ensure!(!name.is_empty(), "A keyword needs a name");
         // Not unique: the first of any duplicates Lightroom left.
-        let candidates: Vec<(i64, String)> = db
-            .prepare_cached("SELECT id, name FROM keywords WHERE parent IS ? ORDER BY id")?
-            .query_map([parent], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?;
+        let candidates: Vec<(i64, String)> = db.query_all(
+            "SELECT id, name FROM keywords WHERE parent IS NOT DISTINCT FROM ? ORDER BY id",
+            [parent],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
         let found = candidates
             .into_iter()
             .find(|(_, n)| keyword_name(n) == name)
             .map(|(id, _)| id);
         parent = Some(match found {
             Some(id) => id,
-            None => {
-                db.execute(
-                    "INSERT INTO keywords(name, parent) VALUES (?, ?)",
-                    params![name, parent],
-                )?;
-                db.last_insert_rowid()
-            }
+            None => db.insert(
+                "INSERT INTO keywords(name, parent) VALUES (?, ?) RETURNING id",
+                params![name, parent],
+            )?,
         });
     }
     Ok(parent.unwrap())
 }
 
-fn keyword(db: &Connection, id: i64) -> Result<Keyword> {
+fn keyword(db: &Db, id: i64) -> Result<Keyword> {
     let mut path = Vec::new();
     // Include on Export of each, from the keyword up.
     let mut include = Vec::new();
@@ -376,12 +372,12 @@ fn keyword(db: &Connection, id: i64) -> Result<Keyword> {
         // A cycle in a damaged catalog would never end.
         ensure!(path.len() < 256, "Keyword hierarchy too deep");
         let (name, parent, included, with_parents): (String, Option<i64>, bool, bool) = db
-            .prepare_cached(
+            .query_opt(
                 "SELECT k.name, k.parent, COALESCE(e.include, 1), COALESCE(e.parents, 1)
                  FROM keywords k LEFT JOIN keyword_export e ON e.keyword = k.id WHERE k.id=?",
+                [k],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )?
-            .query_row([k], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
-            .optional()?
             .context("Unknown keyword")?;
         if path.is_empty() {
             parents = with_parents;
@@ -406,21 +402,24 @@ fn keyword(db: &Connection, id: i64) -> Result<Keyword> {
     })
 }
 
-pub(super) fn read(db: &Connection, id: i64) -> Result<Descriptive> {
+pub(super) fn read(db: &Db, id: i64) -> Result<Descriptive> {
     let states: HashMap<String, String> = db
-        .prepare_cached("SELECT field, state FROM photo_fields WHERE photo=?")?
-        .query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
+        .query_all(
+            "SELECT field, state FROM photo_fields WHERE photo=?",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?
+        .into_iter()
+        .collect();
     let mut d = Descriptive::default();
     for field in TextField::ALL {
         *d.text_mut(field) = match states.get(field.key()).map(String::as_str) {
             Some("set") => {
-                let langs: Vec<(String, String)> = db
-                    .prepare_cached(
-                        "SELECT lang, value FROM photo_text WHERE photo=? AND field=? ORDER BY position",
-                    )?
-                    .query_map(params![id, field.key()], |r| Ok((r.get(0)?, r.get(1)?)))?
-                    .collect::<rusqlite::Result<_>>()?;
+                let langs: Vec<(String, String)> = db.query_all(
+                    "SELECT lang, value FROM photo_text WHERE photo=? AND field=? ORDER BY position",
+                    params![id, field.key()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
                 Some(Value::Set(LangAlt(langs)))
             }
             Some(_) => Some(Value::Cleared),
@@ -428,32 +427,35 @@ pub(super) fn read(db: &Connection, id: i64) -> Result<Descriptive> {
         };
     }
     d.creator = match states.get(CREATOR).map(String::as_str) {
-        Some("set") => Some(Value::Set(
-            db.prepare_cached("SELECT name FROM photo_creators WHERE photo=? ORDER BY position")?
-                .query_map([id], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?,
-        )),
+        Some("set") => Some(Value::Set(db.query_all(
+            "SELECT name FROM photo_creators WHERE photo=? ORDER BY position",
+            [id],
+            |r| r.get(0),
+        )?)),
         Some(_) => Some(Value::Cleared),
         None => None,
     };
-    d.capture = db
-        .prepare_cached("SELECT captured, subsec, offset FROM photo_capture WHERE photo=?")?
-        .query_row([id], |r| {
+    d.capture = db.query_opt(
+        "SELECT captured, subsec, \"offset\" FROM photo_capture WHERE photo=?",
+        [id],
+        |r| {
             Ok(Capture {
                 captured: r.get(0)?,
                 subsec: r.get(1)?,
                 offset: r.get(2)?,
             })
-        })
-        .optional()?;
+        },
+    )?;
     d.location = db
-        .prepare_cached("SELECT lat, lon, alt, cleared FROM photo_location WHERE photo=?")?
-        .query_row([id], |r| {
-            let at: (Option<f64>, Option<f64>, Option<f64>, bool) =
-                (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?);
-            Ok(at)
-        })
-        .optional()?
+        .query_opt(
+            "SELECT lat, lon, alt, cleared FROM photo_location WHERE photo=?",
+            [id],
+            |r| {
+                let at: (Option<f64>, Option<f64>, Option<f64>, bool) =
+                    (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?);
+                Ok(at)
+            },
+        )?
         .map(|(lat, lon, alt, cleared)| match (lat, lon) {
             (Some(lat), Some(lon)) if !cleared => Location::At { lat, lon, alt },
             _ => Location::Cleared,
@@ -462,11 +464,11 @@ pub(super) fn read(db: &Connection, id: i64) -> Result<Descriptive> {
 }
 
 /// Replaces every descriptive row of a photo with `d`.
-pub(super) fn write(db: &Connection, id: i64, d: &Descriptive) -> Result<()> {
+pub(super) fn write(db: &Db, id: i64, d: &Descriptive) -> Result<()> {
     for table in TABLES {
         db.execute(&format!("DELETE FROM {table} WHERE photo=?"), [id])?;
     }
-    let state = |db: &Connection, field: &str, set: bool| -> Result<()> {
+    let state = |db: &Db, field: &str, set: bool| -> Result<()> {
         db.execute(
             "INSERT INTO photo_fields(photo, field, state) VALUES (?, ?, ?)",
             params![id, field, if set { "set" } else { "cleared" }],
@@ -481,8 +483,10 @@ pub(super) fn write(db: &Connection, id: i64, d: &Descriptive) -> Result<()> {
                 state(db, field.key(), true)?;
                 for (position, (lang, value)) in langs.0.iter().enumerate() {
                     db.execute(
-                        "INSERT OR REPLACE INTO photo_text(photo, field, lang, position, value)
-                         VALUES (?, ?, ?, ?, ?)",
+                        "INSERT INTO photo_text(photo, field, lang, position, value)
+                         VALUES (?, ?, ?, ?, ?)
+                         ON CONFLICT(photo, field, lang)
+                         DO UPDATE SET position=excluded.position, value=excluded.value",
                         params![id, field.key(), lang, position as i64, value],
                     )?;
                 }
@@ -504,7 +508,7 @@ pub(super) fn write(db: &Connection, id: i64, d: &Descriptive) -> Result<()> {
     }
     if let Some(c) = &d.capture {
         db.execute(
-            "INSERT INTO photo_capture(photo, captured, subsec, offset) VALUES (?, ?, ?, ?)",
+            "INSERT INTO photo_capture(photo, captured, subsec, \"offset\") VALUES (?, ?, ?, ?)",
             params![id, c.captured, c.subsec, c.offset],
         )?;
         let sort = crate::exif::lightroom_time(&c.captured, c.subsec.as_deref())
@@ -530,17 +534,17 @@ pub(super) fn write(db: &Connection, id: i64, d: &Descriptive) -> Result<()> {
 }
 
 /// Gives `copy` its own copies of `photo`'s descriptive rows.
-pub(super) fn copy_rows(db: &Connection, photo: i64, copy: i64) -> Result<()> {
+pub(super) fn copy_rows(db: &Db, photo: i64, copy: i64) -> Result<()> {
     for (table, columns) in [
         ("photo_fields", "field, state"),
         ("photo_text", "field, lang, position, value"),
         ("photo_creators", "position, name"),
-        ("photo_capture", "captured, subsec, offset"),
+        ("photo_capture", "captured, subsec, \"offset\""),
         ("photo_location", "lat, lon, alt, cleared"),
     ] {
         db.execute(
             &format!(
-                "INSERT INTO {table}(photo, {columns}) SELECT ?, {columns} FROM {table} WHERE photo=?"
+                "INSERT INTO {table}(photo, {columns}) SELECT CAST(? AS BIGINT), {columns} FROM {table} WHERE photo=?"
             ),
             [copy, photo],
         )?;

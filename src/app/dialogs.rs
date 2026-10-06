@@ -19,6 +19,8 @@ pub(super) enum CatalogDialog {
     Create,
     Open,
     ImportLightroom,
+    /// Copies a `.rawmakase` file into the server catalog.
+    CopyToServer,
     Folder(FolderAction),
 }
 

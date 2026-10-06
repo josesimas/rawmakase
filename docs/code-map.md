@@ -148,13 +148,17 @@ recipes and the installed preset collection; they do not own the renderer.
 | [identity.rs](../src/storage/identity.rs) | RAW fingerprints (size, modification time and a hash of the first bytes) that tie edits and cached previews to a file. |
 | [sidecar.rs](../src/storage/sidecar.rs) | Edits saved beside photos before editing moved into the Library: validated and imported into the catalog, with their spots and masks from the companion `*.rawmakase-local.json`, when their folder is added; also read by the CLI's `render`. The library API can still write them. |
 | [session.rs](../src/storage/session.rs) | Last-opened path, monitor profile, raw defaults and other preferences. |
-| [catalog/mod.rs](../src/catalog/mod.rs) | Owns the SQLite connection: catalog lifecycle, browsing queries (photos, folders, collections, roots), metadata and relinking. |
+| [catalog/mod.rs](../src/catalog/mod.rs) | Owns the database connection: catalog lifecycle, browsing queries (photos, folders, collections, roots), metadata and relinking. |
+| [catalog/db.rs](../src/catalog/db.rs) | `Db`, the connection behind a catalog, SQLite or PostgreSQL: one API (`?` placeholders, `RETURNING id`, transactions and savepoints), PostgreSQL's translation, type adaptation and reconnect. Catalog SQL is written once, in the dialect both understand. |
+| [catalog/server.rs](../src/catalog/server.rs) | The PostgreSQL catalog: connection details and their saved `catalog-server.json` (Preferences > Catalog), the `postgres://user@host:port/database` identity that `Catalog::open` accepts, and creating or checking its tables. |
+| [catalog/migrate.rs](../src/catalog/migrate.rs) | Copying a local catalog into an empty server catalog (binary `COPY`, ids kept), and Lightroom import onto the server by way of a temporary local catalog. |
 | [catalog/edits.rs](../src/catalog/edits.rs) | A photo's saved edit: recipe and export options, the spots and masks kept beside them, and bitmaps by hash. |
 | [catalog/develop_history.rs](../src/catalog/develop_history.rs) | A photo's Develop History, saved in the same transaction as its edit; large settings are stored once per History. |
 | [catalog/copies.rs](../src/catalog/copies.rs) | Virtual copies: create, set as master, rename, remove. |
 | [catalog/ingest.rs](../src/catalog/ingest.rs) | Adding a folder of photos, with the edits earlier releases saved beside them. |
 | [models.rs](../src/catalog/models.rs) | Folder, photo, collection and saved-edit records crossing the catalog API. |
 | [schema.sql](../src/catalog/schema.sql) | Every catalog table, idempotent: run on creation and on every open, so older catalogs gain tables added since. |
+| [schema_pg.sql](../src/catalog/schema_pg.sql) | The same tables for PostgreSQL. Keep the two in step; raise `SCHEMA_REVISION` in `server.rs` when it gains a table. |
 | [preview_cache.rs](../src/catalog/preview_cache.rs) | Separate, disposable SQLite JPEG cache with identity checks, offline hits and a size budget. |
 | [lightroom/mod.rs](../src/catalog/lightroom/mod.rs) | Read-only Lightroom snapshot import, source preservation, relational transfer and atomic destination publication. |
 | [lightroom/develop.rs](../src/catalog/lightroom/develop.rs) | Parses Lightroom's serialized Lua settings as data, translates supported controls through XMP, and reports unsupported settings. Never executes Lua. |

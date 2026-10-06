@@ -2,12 +2,13 @@
 mod develop;
 pub(super) mod history;
 use super::Catalog;
+use super::db::{Db, params};
 use anyhow::{Context, Result, ensure};
 pub use develop::convert_develop;
 #[cfg(test)]
 pub(super) use develop::develop_fields;
 pub use history::HistoryStep;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
 
 /// Set in `meta` once keyword export options have been copied from the
@@ -32,15 +33,16 @@ impl Catalog {
     pub(in crate::catalog) fn backfill_once(
         &mut self,
         key: &str,
-        copy: fn(&Connection) -> Result<usize>,
+        copy: fn(&Db) -> Result<usize>,
     ) -> Result<usize> {
-        if self.meta(key)?.is_some() {
+        // A server catalog was filled from a complete local import.
+        if self.meta(key)?.is_some() || self.is_server() {
             return Ok(0);
         }
         // One transaction: a row at a time would flush the journal for each.
         let copied = self
             .with_stored_lightroom(|db| {
-                let tx = db.unchecked_transaction()?;
+                let tx = db.transaction()?;
                 let copied = copy(&tx)?;
                 tx.commit()?;
                 Ok(copied)
@@ -51,18 +53,12 @@ impl Catalog {
     }
     /// Runs `f` with the Lightroom catalog this one was imported from
     /// attached as `lr`; `None` for a catalog that was not imported.
-    fn with_stored_lightroom<T>(
-        &mut self,
-        f: impl FnOnce(&Connection) -> Result<T>,
-    ) -> Result<Option<T>> {
-        let original: Option<Vec<u8>> = self
-            .db
-            .query_row(
-                "SELECT original_catalog FROM sources WHERE original_catalog IS NOT NULL LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
+    fn with_stored_lightroom<T>(&mut self, f: impl FnOnce(&Db) -> Result<T>) -> Result<Option<T>> {
+        let original: Option<Vec<u8>> = self.db.query_opt(
+            "SELECT original_catalog FROM sources WHERE original_catalog IS NOT NULL LIMIT 1",
+            (),
+            |r| r.get(0),
+        )?;
         let Some(original) = original else {
             return Ok(None);
         };
@@ -79,36 +75,36 @@ impl Catalog {
 }
 
 /// Whether the database attached as `schema` has table `name`.
-pub(super) fn has_table(db: &Connection, schema: &str, name: &str) -> Result<bool> {
+pub(super) fn has_table(db: &Db, schema: &str, name: &str) -> Result<bool> {
     Ok(db
-        .query_row(
+        .query_opt(
             &format!("SELECT 1 FROM {schema}.sqlite_master WHERE type='table' AND name=?"),
             [name],
-            |r| r.get::<_, i32>(0),
-        )
-        .optional()?
+            |r| r.get::<i32>(0),
+        )?
         .is_some())
 }
 
 /// Copies Lightroom's Include on Export and Export Containing Keywords of
 /// the keywords that have either off, from a catalog attached as `lr`.
-pub(super) fn copy_keyword_export(db: &Connection) -> Result<usize> {
-    let columns: Vec<String> = db
-        .prepare("SELECT name FROM pragma_table_info('AgLibraryKeyword', 'lr')")?
-        .query_map([], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
+pub(super) fn copy_keyword_export(db: &Db) -> Result<usize> {
+    let columns: Vec<String> = db.query_all(
+        "SELECT name FROM pragma_table_info('AgLibraryKeyword', 'lr')",
+        (),
+        |r| r.get(0),
+    )?;
     let has = |c: &str| columns.iter().any(|n| n == c);
     if !has("includeOnExport") || !has("includeParents") {
         return Ok(0);
     }
-    Ok(db.execute(
+    db.execute(
         "INSERT OR REPLACE INTO keyword_export(keyword, include, parents)
          SELECT id_local, COALESCE(includeOnExport, 1) <> 0, COALESCE(includeParents, 1) <> 0
          FROM lr.AgLibraryKeyword
          WHERE (includeOnExport = 0 OR includeParents = 0)
            AND id_local IN (SELECT id FROM keywords)",
-        [],
-    )?)
+        (),
+    )
 }
 
 /// Import a closed/exported Lightroom catalog into a new, atomically published file.
@@ -128,7 +124,7 @@ pub fn import_lightroom(source: &Path, destination: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(parent)?;
     let tmpdir = tempfile::tempdir_in(parent)?;
     let working = tmpdir.path().join("import.rawmakase");
-    let mut catalog = Catalog::create(&working)?;
+    let catalog = Catalog::create(&working)?;
     catalog.db.execute(
         "ATTACH DATABASE ? AS lr",
         [snapshot.path().to_string_lossy()],
@@ -148,7 +144,7 @@ pub fn import_lightroom(source: &Path, destination: &Path) -> Result<PathBuf> {
     ensure!(
         catalog
             .db
-            .query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0))?
+            .query_row("PRAGMA quick_check", (), |r| r.get::<String>(0))?
             == "ok",
         "Imported catalog failed integrity check"
     );
@@ -193,9 +189,12 @@ fn take_snapshot(source: &Path) -> Result<(tempfile::NamedTempFile, u64)> {
 /// Checks the snapshot is an intact Lightroom catalog with the tables an
 /// import needs.
 fn verify_snapshot(snapshot: &Path) -> Result<()> {
-    let db = Connection::open_with_flags(snapshot, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let db = Db::sqlite(Connection::open_with_flags(
+        snapshot,
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?);
     ensure!(
-        db.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0))? == "ok",
+        db.query_row("PRAGMA quick_check", (), |r| r.get::<String>(0))? == "ok",
         "Source catalog failed SQLite integrity check"
     );
     for table in [
@@ -215,7 +214,7 @@ fn verify_snapshot(snapshot: &Path) -> Result<()> {
 /// Copies photos, folders, history, collections, keywords, info and
 /// descriptive metadata from the Lightroom catalog attached as `lr`, in the
 /// caller's transaction. Fails if any image was left out.
-fn copy_tables(tx: &Connection) -> Result<()> {
+fn copy_tables(tx: &Db) -> Result<()> {
     tx.execute_batch(&format!("INSERT INTO roots(id,original_path) SELECT id_local,absolutePath FROM lr.AgLibraryRootFolder;
     INSERT INTO folders(id,root,relative_path) SELECT id_local,rootFolder,pathFromRoot FROM lr.AgLibraryFolder;
     INSERT INTO photos(id,folder,filename,original_path,captured,rating,flag,label,format,copy_name,master_id,orientation)
@@ -257,8 +256,8 @@ fn copy_tables(tx: &Connection) -> Result<()> {
     if has("AgLibraryKeywordImage")? {
         tx.execute_batch("INSERT OR IGNORE INTO photo_keywords SELECT image,tag FROM lr.AgLibraryKeywordImage WHERE image IN(SELECT id FROM photos) AND tag IN(SELECT id FROM keywords);")?;
     }
-    let imported: i64 = tx.query_row("SELECT count(*) FROM photos", [], |r| r.get(0))?;
-    let expected: i64 = tx.query_row("SELECT count(*) FROM lr.Adobe_images", [], |r| r.get(0))?;
+    let imported: i64 = tx.query_row("SELECT count(*) FROM photos", (), |r| r.get(0))?;
+    let expected: i64 = tx.query_row("SELECT count(*) FROM lr.Adobe_images", (), |r| r.get(0))?;
     ensure!(
         imported == expected,
         "Catalog has orphaned image records ({imported}/{expected}); import rolled back"

@@ -1,9 +1,9 @@
 //! A photo's saved edit: its recipe and export options, the spots and masks
 //! kept beside them, and the bitmaps recipes refer to by hash.
+use super::db::params;
 use super::{Catalog, SavedEdit};
 use crate::{develop::Recipe, export::ExportOptions, storage::Identity};
 use anyhow::{Context, Result, ensure};
-use rusqlite::{OptionalExtension, params};
 use std::path::Path;
 
 /// One photo's change for [`Catalog::change_edits`].
@@ -26,19 +26,18 @@ impl Catalog {
     pub fn put_bitmap(&self, bitmap: &crate::storage::bitmaps::Bitmap) -> Result<String> {
         let hash = bitmap.hash();
         self.db.execute(
-            "INSERT OR IGNORE INTO bitmaps(hash, data) VALUES (?, ?)",
+            "INSERT INTO bitmaps(hash, data) VALUES (?, ?) ON CONFLICT DO NOTHING",
             params![hash, bitmap.compress()?],
         )?;
         Ok(hash)
     }
     #[cfg(test)]
     pub(crate) fn bitmap(&self, hash: &str) -> Result<Option<crate::storage::bitmaps::Bitmap>> {
-        let data: Option<Vec<u8>> = self
-            .db
-            .query_row("SELECT data FROM bitmaps WHERE hash=?", [hash], |r| {
-                r.get(0)
-            })
-            .optional()?;
+        let data: Option<Vec<u8>> =
+            self.db
+                .query_opt("SELECT data FROM bitmaps WHERE hash=?", [hash], |r| {
+                    r.get(0)
+                })?;
         data.map(|d| crate::storage::bitmaps::Bitmap::decompress(&d))
             .transpose()
     }
@@ -76,7 +75,7 @@ impl Catalog {
                 let _ = self.load_edit(e.id, e.path)?;
             }
         }
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.db.transaction()?;
         let mut identities = identities.into_iter();
         for change in changes {
             let e = match change {
@@ -95,7 +94,8 @@ impl Catalog {
                 tx.execute("DELETE FROM local_edits WHERE photo=?", [e.id])?;
             } else {
                 tx.execute(
-                    "INSERT OR REPLACE INTO local_edits(photo, data) VALUES (?, ?)",
+                    "INSERT INTO local_edits(photo, data) VALUES (?, ?)
+                     ON CONFLICT(photo) DO UPDATE SET data=excluded.data",
                     params![e.id, serde_json::to_string(&local)?],
                 )?;
             }
@@ -106,12 +106,11 @@ impl Catalog {
     }
     /// The photo's spots and masks, saved apart from its recipe.
     fn local_edits(&self, id: i64) -> Result<crate::develop::LocalEdits> {
-        let data: Option<String> = self
-            .db
-            .query_row("SELECT data FROM local_edits WHERE photo=?", [id], |r| {
-                r.get(0)
-            })
-            .optional()?;
+        let data: Option<String> =
+            self.db
+                .query_opt("SELECT data FROM local_edits WHERE photo=?", [id], |r| {
+                    r.get(0)
+                })?;
         let local: crate::develop::LocalEdits = match data {
             Some(d) => serde_json::from_str(&d)?,
             None => Default::default(),
@@ -148,30 +147,37 @@ impl Catalog {
     /// UTC: in RAWmakase, or else in Lightroom, whose history counts seconds
     /// from 2001.
     pub fn edit_times(&self) -> Result<std::collections::HashMap<i64, String>> {
-        let mut query = self.db.prepare(
-            "SELECT p.id, COALESCE(p.edited_at,
-                 (SELECT datetime(MAX(h.created) + 978307200, 'unixepoch')
-                  FROM lightroom_history h WHERE h.photo = p.id))
+        // SQLite rounds to the millisecond, then drops them.
+        let seconds = if self.db.is_postgres() {
+            "to_char(to_timestamp(floor((MAX(h.created) + 978307200) * 1000 + 0.5) / 1000) AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')"
+        } else {
+            "datetime(MAX(h.created) + 978307200, 'unixepoch')"
+        };
+        let rows = self.db.query_all(
+            &format!(
+                "SELECT p.id, COALESCE(p.edited_at,
+                 (SELECT {seconds} FROM lightroom_history h WHERE h.photo = p.id))
              FROM photos p
              WHERE p.edited_at IS NOT NULL
                 OR EXISTS (SELECT 1 FROM lightroom_history h
-                           WHERE h.photo = p.id AND h.created IS NOT NULL)",
+                           WHERE h.photo = p.id AND h.created IS NOT NULL)"
+            ),
+            (),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        let rows = query.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        Ok(rows.into_iter().collect())
     }
     /// Changes whenever the photo's edit does: a hash of its recipe, its
     /// spots and masks, and its Lightroom settings. Cheaper than reading
     /// the edit itself, for previews to notice an edit saved elsewhere.
     pub fn edit_stamp(&self, id: i64) -> Result<u64> {
         use std::hash::{Hash, Hasher};
-        let texts: [Option<String>; 3] = self
-            .db
-            .prepare_cached(
-                "SELECT recipe, lightroom_develop, \
-                 (SELECT data FROM local_edits WHERE photo=photos.id) FROM photos WHERE id=?",
-            )?
-            .query_row([id], |r| Ok([r.get(0)?, r.get(1)?, r.get(2)?]))?;
+        let texts: [Option<String>; 3] = self.db.query_row(
+            "SELECT recipe, lightroom_develop, \
+             (SELECT data FROM local_edits WHERE photo=photos.id) FROM photos WHERE id=?",
+            [id],
+            |r| Ok([r.get(0)?, r.get(1)?, r.get(2)?]),
+        )?;
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         texts.hash(&mut hasher);
         Ok(hasher.finish())

@@ -16,7 +16,8 @@ fn supplied_catalog_is_preserved_and_all_images_import() -> Result<()> {
     assert_eq!(c.folders()?.len(), 275);
     assert_eq!(c.collections()?.len(), 13);
     let archive: Vec<u8> =
-        c.db.query_row("SELECT original_catalog FROM sources", [], |r| r.get(0))?;
+        c.db_for_tests()
+            .query_row("SELECT original_catalog FROM sources", [], |r| r.get(0))?;
     assert_eq!(archive, std::fs::read(&source)?);
     assert_eq!(before, Identity::read(&source)?);
     for (id, make, model) in [(350644, "Sony", "ILCE-7M2"), (1062257, "Fujifilm", "X100F")] {

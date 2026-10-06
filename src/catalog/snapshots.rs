@@ -3,9 +3,9 @@
 //! where snapshots belong to one image. Snapshots imported from Lightroom keep
 //! Lightroom's settings text and are converted when applied.
 use super::Catalog;
+use super::db::params;
 use crate::develop::Recipe;
 use anyhow::{Context, Result, ensure};
-use rusqlite::params;
 
 /// Copies snapshots from a Lightroom catalog attached as `lr`.
 pub(super) const COPY_LIGHTROOM_SNAPSHOTS: &str =
@@ -44,31 +44,24 @@ impl Catalog {
             if !super::lightroom::has_table(db, "lr", "Adobe_libraryImageDevelopSnapshot")? {
                 return Ok(0);
             }
-            Ok(db.execute(COPY_LIGHTROOM_SNAPSHOTS, [])?)
+            db.execute(COPY_LIGHTROOM_SNAPSHOTS, ())
         })
     }
     /// The photo's snapshots, alphabetically as Lightroom lists them. A snapshot
     /// that cannot be read (from a newer release) is left out.
     pub fn snapshots(&self, photo: i64) -> Result<Vec<Snapshot>> {
-        let mut q = self
-            .db
-            .prepare("SELECT id, name, recipe, lightroom FROM develop_snapshots WHERE photo=?")?;
-        let rows = q
-            .query_map([photo], |r| {
-                let lightroom = match r.get_ref(3)? {
-                    rusqlite::types::ValueRef::Text(t) | rusqlite::types::ValueRef::Blob(t) => {
-                        Some(t.to_vec())
-                    }
-                    _ => None,
-                };
+        let rows = self.db.query_all(
+            "SELECT id, name, recipe, lightroom FROM develop_snapshots WHERE photo=?",
+            [photo],
+            |r| {
                 Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                    lightroom,
+                    r.get::<i64>(0)?,
+                    r.get::<String>(1)?,
+                    r.get::<Option<String>>(2)?,
+                    r.get::<Option<Vec<u8>>>(3)?,
                 ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            },
+        )?;
         let mut snapshots: Vec<Snapshot> = rows
             .into_iter()
             .filter_map(|(id, name, recipe, lightroom)| {
@@ -92,11 +85,10 @@ impl Catalog {
     /// Saves `recipe` as a new snapshot of the photo named `name`; returns its id.
     pub fn add_snapshot(&self, photo: i64, name: &str, recipe: &Recipe) -> Result<i64> {
         recipe.validate()?;
-        self.db.execute(
-            "INSERT INTO develop_snapshots(photo, name, recipe) VALUES (?, ?, ?)",
+        self.db.insert(
+            "INSERT INTO develop_snapshots(photo, name, recipe) VALUES (?, ?, ?) RETURNING id",
             params![photo, snapshot_name(name)?, serde_json::to_string(recipe)?],
-        )?;
-        Ok(self.db.last_insert_rowid())
+        )
     }
     /// Lightroom's Update with Current Settings: the snapshot now holds `recipe`.
     pub fn update_snapshot(&self, id: i64, recipe: &Recipe) -> Result<()> {

@@ -5,6 +5,7 @@ use super::Editor;
 use super::dialogs::{CatalogDialog, FileDialog};
 use super::widgets::{form_row, modal_frame, plural, pretty_path, primary_button};
 use crate::app::theme;
+use crate::catalog::server::{Mode, ServerConfig, Settings};
 use crate::raw::Demosaic;
 use eframe::egui::{self, Color32, Sense, Stroke, Vec2};
 use std::path::{Path, PathBuf};
@@ -67,6 +68,13 @@ pub(super) struct Preferences {
     defaults_failed: bool,
     /// Raw Defaults' camera rows.
     pub(super) raw_defaults: super::raw_defaults::Form,
+    /// Local or server catalog, and the server's details as typed. Saved
+    /// when Connect is pressed, or the choice of Local made.
+    pub(super) catalog_source: Settings,
+    pub(super) server_port: String,
+    /// A connection test running, and what the last one said.
+    server_test: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    server_message: Option<(bool, String)>,
 }
 
 const WIDTH: f32 = 780.;
@@ -134,6 +142,10 @@ impl Editor {
         self.preferences.open = true;
         self.preferences.tab = tab;
         self.preferences.status_at_open = self.status.clone();
+        self.preferences.catalog_source = Settings::load();
+        self.preferences.server_port = self.preferences.catalog_source.server.port.to_string();
+        self.preferences.server_test = None;
+        self.preferences.server_message = None;
         // Edits not saved yet are kept, not replaced by the file's.
         if !self.preferences.defaults_dirty {
             self.preferences.defaults = crate::catalog::MetadataDefaults::load();
@@ -149,7 +161,9 @@ impl Editor {
             decode_cache: files(&decode_cache_dir(), &["decoded"]),
             previews: std::fs::metadata(crate::catalog::preview_cache::PreviewCache::path())
                 .map_or(0, |m| m.len()),
-            catalog: catalog.and_then(|c| std::fs::metadata(&c.path).ok().map(|m| m.len())),
+            catalog: catalog
+                .filter(|c| !c.is_server())
+                .and_then(|c| std::fs::metadata(&c.path).ok().map(|m| m.len())),
             folders: catalog.and_then(|c| c.folders().ok().map(|f| f.len())),
         };
         self.preferences.stale = self.activity.is_dialog();
@@ -355,14 +369,194 @@ impl Editor {
         });
     }
 
+    /// Local Catalog or Server Catalog, and the PostgreSQL connection details.
+    fn catalog_source_section(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        group(ui, "Catalog storage");
+        let mut chosen = None;
+        form_row(ui, "Use", |ui| {
+            let mut mode = self.preferences.catalog_source.mode;
+            ui.radio_value(&mut mode, Mode::Local, "Local Catalog");
+            ui.radio_value(&mut mode, Mode::Server, "Server Catalog");
+            if mode != self.preferences.catalog_source.mode {
+                chosen = Some(mode);
+            }
+        });
+        if let Some(mode) = chosen {
+            self.choose_catalog_mode(mode, &ctx);
+        }
+        if self.preferences.catalog_source.mode == Mode::Local {
+            form_row(ui, "", |ui| {
+                hint(
+                    ui,
+                    "A .rawmakase file on this computer. Open or create one under Catalogs below.",
+                );
+            });
+            gap(ui);
+            return;
+        }
+        let typed = &mut self.preferences.catalog_source.server;
+        let mut changed = false;
+        form_row(ui, "Server", |ui| {
+            changed |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut typed.host)
+                        .hint_text("192.168.1.10")
+                        .desired_width(200.),
+                )
+                .changed();
+            ui.label(egui::RichText::new("Port").color(theme::gray(150)));
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.preferences.server_port)
+                        .desired_width(56.),
+                )
+                .changed()
+            {
+                changed = true;
+                typed.port = self.preferences.server_port.trim().parse().unwrap_or(0);
+            }
+        });
+        form_row(ui, "Database", |ui| {
+            changed |= ui
+                .add(egui::TextEdit::singleline(&mut typed.database).desired_width(200.))
+                .changed();
+        });
+        form_row(ui, "User", |ui| {
+            changed |= ui
+                .add(egui::TextEdit::singleline(&mut typed.user).desired_width(200.))
+                .changed();
+        });
+        form_row(ui, "Password", |ui| {
+            changed |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut typed.password)
+                        .password(true)
+                        .desired_width(200.),
+                )
+                .changed();
+        });
+        if changed {
+            self.preferences.server_message = None;
+        }
+        let complete = self.preferences.catalog_source.server.is_complete();
+        let testing = self.preferences.server_test.is_some();
+        let mut test = false;
+        let mut connect = false;
+        form_row(ui, "", |ui| {
+            test = ui
+                .add_enabled(complete && !testing, egui::Button::new("Test Connection"))
+                .clicked();
+            connect = ui
+                .add_enabled(
+                    complete && !testing && !self.activity.is_busy(),
+                    egui::Button::new("Connect"),
+                )
+                .clicked();
+        });
+        if let Some(rx) = &self.preferences.server_test {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.preferences.server_message = Some(match result {
+                        Ok(text) => (true, text),
+                        Err(text) => (false, text),
+                    });
+                    self.preferences.server_test = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                }
+                Err(_) => self.preferences.server_test = None,
+            }
+        }
+        if testing {
+            form_row(ui, "", |ui| hint(ui, "Connecting…"));
+        } else if let Some((ok, text)) = &self.preferences.server_message {
+            form_row(ui, "", |ui| {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(text).size(12.).color(if *ok {
+                        theme::gray(190)
+                    } else {
+                        Color32::from_rgb(230, 120, 110)
+                    }))
+                    .wrap(),
+                );
+            });
+        }
+        form_row(ui, "", |ui| {
+            hint(
+                ui,
+                "The database must be empty or already hold a RAWmakase catalog. \
+                 The connection is not encrypted: use a trusted network. The password \
+                 is saved in the app data folder, readable only by you.",
+            );
+        });
+        if test {
+            self.test_server_connection(ctx.clone());
+        }
+        if connect {
+            self.connect_server(&ctx);
+        }
+        gap(ui);
+    }
+    /// Checks the typed details without saving or opening anything.
+    fn test_server_connection(&mut self, ctx: egui::Context) {
+        let config: ServerConfig = self.preferences.catalog_source.server.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.preferences.server_test = Some(rx);
+        self.preferences.server_message = None;
+        std::thread::spawn(move || {
+            let _ = tx.send(config.test().map_err(|e| format!("{e:#}")));
+            ctx.request_repaint();
+        });
+    }
+    /// Saves the typed details and opens the server's catalog.
+    fn connect_server(&mut self, ctx: &egui::Context) {
+        let mut settings = self.preferences.catalog_source.clone();
+        settings.mode = Mode::Server;
+        settings.server.host = settings.server.host.trim().into();
+        if let Err(e) = settings.save() {
+            self.preferences.server_message = Some((false, format!("Not saved: {e:#}")));
+            return;
+        }
+        self.preferences.catalog_source = settings.clone();
+        self.load_catalog(settings.server.location(), ctx);
+    }
+    /// The radio buttons: Local opens the last local catalog, Server connects
+    /// when its details are known.
+    fn choose_catalog_mode(&mut self, mode: Mode, ctx: &egui::Context) {
+        self.preferences.catalog_source.mode = mode;
+        let mut saved = Settings::load();
+        saved.mode = mode;
+        if let Err(e) = saved.save() {
+            self.status = format!("Catalog choice not saved: {e:#}");
+        }
+        let open_is_server = self.library.as_ref().is_some_and(|l| l.catalog.is_server());
+        match mode {
+            Mode::Local => {
+                if open_is_server
+                    && let Some(last) = saved.last_local.clone().filter(|p| p.exists())
+                {
+                    self.load_catalog(last, ctx);
+                }
+            }
+            Mode::Server => {
+                if !open_is_server && saved.server.is_complete() && !self.activity.is_busy() {
+                    self.load_catalog(saved.server.location(), ctx);
+                }
+            }
+        }
+    }
+
     fn catalog_page(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.catalog_source_section(ui);
         let usage = &self.preferences.usage;
         if let Some(library) = &self.library {
             let path = library.catalog.path.clone();
             group(ui, "Current catalog");
             form_row(ui, "Name", |ui| {
-                value(ui, &path.file_stem().unwrap_or_default().to_string_lossy());
+                value(ui, &crate::catalog::server::display_name(&path));
             });
             form_row(ui, "Location", |ui| path_value(ui, &path));
             form_row(ui, "", |ui| reveal_button(ui, &path));
@@ -423,6 +617,25 @@ impl Editor {
                 }
             }
         });
+        if self.preferences.catalog_source.server.is_complete() {
+            form_row(ui, "", |ui| {
+                if ui
+                    .button("Copy a Local Catalog to the Server…")
+                    .on_hover_text(
+                        "Copies a .rawmakase file into the server's database, which must be empty",
+                    )
+                    .clicked()
+                {
+                    // The dialog reads the saved details.
+                    let mut saved = Settings::load();
+                    saved.server = self.preferences.catalog_source.server.clone();
+                    match saved.save() {
+                        Ok(()) => self.catalog_dialog(CatalogDialog::CopyToServer, &ctx),
+                        Err(e) => self.status = format!("Server details not saved: {e:#}"),
+                    }
+                }
+            });
+        }
     }
 
     fn profiles_page(&mut self, ui: &mut egui::Ui) {

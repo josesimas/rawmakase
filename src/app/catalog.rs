@@ -55,6 +55,20 @@ impl Editor {
                         Some(path)
                     }
                     CatalogDialog::Open => catalog_file_dialog().pick_file(),
+                    CatalogDialog::CopyToServer => {
+                        let server = crate::catalog::server::Settings::load().server;
+                        let Some(file) = catalog_file_dialog().pick_file() else {
+                            return Ok(None);
+                        };
+                        let _ = tx.send(Event::CatalogWorking(format!(
+                            "Copying {} to the server…",
+                            file.file_name().unwrap_or_default().to_string_lossy()
+                        )));
+                        ctx.request_repaint();
+                        Some(crate::catalog::migrate::copy_file_to_server(
+                            &file, &server,
+                        )?)
+                    }
                     CatalogDialog::ImportLightroom => {
                         let Some(source) = rfd::FileDialog::new()
                             .add_filter("Lightroom catalog", &["lrcat"])
@@ -62,6 +76,20 @@ impl Editor {
                         else {
                             return Ok(None);
                         };
+                        // With Server Catalog chosen, the import goes to the server.
+                        if let Some(server) = crate::catalog::server::Settings::load()
+                            .active_server()
+                            .cloned()
+                        {
+                            let _ = tx.send(Event::CatalogWorking(format!(
+                                "Importing {} to the server…",
+                                source.file_name().unwrap_or_default().to_string_lossy()
+                            )));
+                            ctx.request_repaint();
+                            return Ok(Some(crate::catalog::migrate::import_lightroom_to_server(
+                                &source, &server,
+                            )?));
+                        }
                         let Some(destination) = catalog_file_dialog()
                             .set_file_name(format!(
                                 "{}.rawmakase",
@@ -115,7 +143,7 @@ impl Editor {
             if let Ok(Some(path)) = &result {
                 let _ = tx.send(Event::CatalogWorking(format!(
                     "Opening {}…",
-                    path.file_stem().unwrap_or_default().to_string_lossy()
+                    crate::catalog::server::display_name(path)
                 )));
                 ctx.request_repaint();
             }

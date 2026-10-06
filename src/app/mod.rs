@@ -174,7 +174,22 @@ impl Editor {
                 .and_then(std::path::Path::parent)
                 .map(|dir| (dir.to_path_buf(), ctx)),
         );
-        let last = session.last_path.clone().filter(|p| p.exists());
+        // The server catalog when Preferences chose it, else the last local one.
+        // (Not read where persistence is off, as in the tests.)
+        let catalog_settings = if session_file.is_some() {
+            crate::catalog::server::Settings::load()
+        } else {
+            Default::default()
+        };
+        let last = match catalog_settings.active_server() {
+            Some(server) => Some(server.location()),
+            None => session
+                .last_path
+                .clone()
+                .filter(|p| !crate::catalog::server::is_location(p))
+                .filter(|p| p.exists())
+                .or_else(|| catalog_settings.last_local.clone().filter(|p| p.exists())),
+        };
         let (tx, rx) = mpsc::channel();
         let loader = worker::loader(tx.clone(), ctx.clone());
         let renderer = worker::renderer_with_backend(tx.clone(), ctx.clone(), backend);
