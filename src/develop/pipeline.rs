@@ -76,7 +76,7 @@ pub(crate) fn gray_mix_shift(mix: f32, chroma: f32) -> f32 {
 }
 const GRAY_MIX_BRIGHTEN: f32 = 1.78;
 const GRAY_MIX_DARKEN: f32 = 4.37;
-fn hue_weights(hue: f32) -> [f32; 8] {
+pub(crate) fn hue_weights(hue: f32) -> [f32; 8] {
     // Centers correspond to red, orange, yellow, green, cyan, blue, purple, magenta in Oklab.
     const CENTERS: [f32; 8] = [0.081, 0.151, 0.305, 0.395, 0.541, 0.733, 0.815, 0.912];
     let mut weights = [0.; 8];
@@ -182,7 +182,7 @@ fn tone_stage(
         if exposure != 0. {
             // The ramp's black point follows exposure, as for the global slider.
             let ramp = ExposureRamp::new(
-                DNG_SHADOWS_BLACK * (r.exposure + r.camera_exposure + exposure).exp2(),
+                default_black(r) * (r.exposure + r.camera_exposure + exposure).exp2(),
             );
             rgb = rgb.map(|v| ramp.eval(v));
         } else {
@@ -235,14 +235,22 @@ fn tone_stage(
     };
     (rgb, clipped_chroma)
 }
-/// Basic curves, point curves, color controls and output encoding.
-fn color_stage(
+/// The tone curves, the color mixer and Point Color: linear display RGB as Point
+/// Color leaves it, and Visualize Range's selection.
+fn mixer_stage(
     rgb: [f32; 3],
-    clipped_chroma: f32,
     r: &Recipe,
     lut: &CurveSet,
     local: Option<&LocalDelta>,
-) -> [f32; 3] {
+) -> crate::develop::point_color::Rendered {
+    let sampled = |color| crate::develop::point_color::Rendered {
+        color,
+        selection: None,
+    };
+    if lut.output == PixelOutput::CurveInput {
+        let [red, green, blue] = curve_input(rgb, r, lut, local);
+        return sampled([0.299 * red + 0.587 * green + 0.114 * blue; 3]);
+    }
     let rgb = if r.reference_curves {
         apply_reference_curves(rgb, r, lut, local)
     } else if r.wide_gamut_curves {
@@ -257,14 +265,40 @@ fn color_stage(
     // count as shadows.
     // Engine 4: the measured color mixer replaces the Oklab HSL/Saturation/Vibrance below.
     // Applied after the tone curves, which matches Lightroom references with point curves.
+    if lut.output == PixelOutput::MixerInput {
+        return sampled(mul(crate::camera_profiles::RGB_TO_PRO, rgb));
+    }
     let rgb = lut.mixer.as_ref().map_or(rgb, |m| m.apply(rgb));
     // Point Color works where the mixer does, in HSV of linear ProPhoto RGB.
-    let rgb = lut.point_colors.as_ref().map_or(rgb, |p| {
-        mul(
-            crate::camera_profiles::PRO_TO_RGB,
-            p.apply_prophoto(mul(crate::camera_profiles::RGB_TO_PRO, rgb)),
-        )
-    });
+    match &lut.point_colors {
+        Some(p) => {
+            let out = p.render_prophoto(mul(crate::camera_profiles::RGB_TO_PRO, rgb));
+            crate::develop::point_color::Rendered {
+                color: mul(crate::camera_profiles::PRO_TO_RGB, out.color),
+                selection: out.selection,
+            }
+        }
+        None => crate::develop::point_color::Rendered {
+            color: rgb,
+            selection: None,
+        },
+    }
+}
+/// Basic curves, point curves, color controls and output encoding.
+fn color_stage(
+    rgb: [f32; 3],
+    clipped_chroma: f32,
+    r: &Recipe,
+    lut: &CurveSet,
+    local: Option<&LocalDelta>,
+) -> [f32; 3] {
+    let mixed = mixer_stage(rgb, r, lut, local);
+    let rgb = mixed.color;
+    match lut.output {
+        PixelOutput::PointColor => return mul(crate::camera_profiles::RGB_TO_PRO, rgb),
+        PixelOutput::CurveInput | PixelOutput::MixerInput => return rgb,
+        PixelOutput::Display | PixelOutput::ColorInput => {}
+    }
     // A look's RGB table: after the colour mixer, before colour grading, as Camera
     // Raw 18.7 applies it (also after the user's tone curves and Saturation). Before
     // engine 4 the colour controls come later, in Oklab, and the table after them.
@@ -279,6 +313,9 @@ fn color_stage(
     }
     lab[1] *= clipped_chroma;
     lab[2] *= clipped_chroma;
+    if lut.output == PixelOutput::ColorInput {
+        return lab;
+    }
     if lut.color_adjustments {
         let chroma = lab[1].hypot(lab[2]);
         let hue = lab[2].atan2(lab[1]).rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU;
@@ -329,7 +366,12 @@ fn color_stage(
         lab = legacy_rgb_table(lab, lut);
         lab[0] = lab[0].clamp(0., 1.);
     }
-    finish_color(lab, r, lut)
+    let out = finish_color(lab, r, lut);
+    // Visualize Range grays what the swatch leaves out after every color control, so
+    // none of them tints it.
+    mixed
+        .selection
+        .map_or(out, |w| crate::develop::point_color::visualize(out, w))
 }
 /// Before engine 4 the colour controls run in Oklab, after the place of the measured
 /// mixer: a look's RGB table follows them there, before Monochrome. Engine 3's point
@@ -379,20 +421,9 @@ fn finish_color(mut lab: [f32; 3], r: &Recipe, lut: &CurveSet) -> [f32; 3] {
         lab[0] = lab[0].clamp(0., 1.);
         lab_to_srgb(lab)
     };
-    // Compress chroma toward neutral instead of clipping individual negative channels.
-    let gray = lab[0].clamp(0., 1.).powi(3);
-    let mut gamut = 1f32;
-    for v in rgb {
-        if v < 0. {
-            gamut = gamut.min(gray / (gray - v).max(1e-8));
-        }
-        if v > 1. {
-            gamut = gamut.min((1. - gray) / (v - gray).max(1e-8));
-        }
-    }
+    let rgb = r.gamut_model.into_srgb(rgb, lab[0]);
     std::array::from_fn(|c| {
-        let v = rgb[c];
-        let encoded = srgb_encode(gray + (v - gray) * gamut);
+        let encoded = srgb_encode(rgb[c]);
         if r.wide_gamut_curves || r.reference_curves {
             encoded.clamp(0., 1.)
         } else {
@@ -401,7 +432,66 @@ fn finish_color(mut lab: [f32; 3], r: &Recipe, lut: &CurveSet) -> [f32; 3] {
     })
 }
 
+/// How colors outside sRGB are brought into it at the end of the color stage.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum GamutModel {
+    /// Chroma compressed toward the neutral of the same lightness: what recipes saved
+    /// before the clipped model keep, so they render as they did.
+    #[default]
+    Compress,
+    /// Each channel clipped on its own, as Camera Raw's conversion to sRGB does
+    /// (docs/color-pipeline.md#out-of-gamut-colors).
+    Clip,
+}
+impl GamutModel {
+    pub(crate) fn is_compress(&self) -> bool {
+        *self == Self::Compress
+    }
+    /// Linear sRGB inside 0–1; `lightness` is the color's Oklab lightness.
+    pub(crate) fn into_srgb(self, rgb: [f32; 3], lightness: f32) -> [f32; 3] {
+        match self {
+            Self::Clip => rgb.map(|v| v.clamp(0., 1.)),
+            Self::Compress => {
+                // Compress chroma toward neutral instead of clipping single channels.
+                let gray = lightness.clamp(0., 1.).powi(3);
+                let mut gamut = 1f32;
+                for v in rgb {
+                    if v < 0. {
+                        gamut = gamut.min(gray / (gray - v).max(1e-8));
+                    }
+                    if v > 1. {
+                        gamut = gamut.min((1. - gray) / (v - gray).max(1e-8));
+                    }
+                }
+                rgb.map(|v| gray + (v - gray) * gamut)
+            }
+        }
+    }
+}
+
+/// What the per-pixel stage hands back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum PixelOutput {
+    /// The finished, encoded color.
+    #[default]
+    Display,
+    /// Linear ProPhoto RGB after the swatches already there: what Point Color's
+    /// dropper samples.
+    PointColor,
+    /// The parametric curve's input, as the luma of the three channels it curves
+    /// (Rec. 601 weights, as Refine Saturation's): what the Tone Curve's Targeted
+    /// Adjustment Tool samples, in every channel.
+    CurveInput,
+    /// Linear ProPhoto RGB where the color mixer works, after the tone curves: what
+    /// the Color Mixer's Targeted Adjustment Tool samples.
+    MixerInput,
+    /// Oklab where the color controls and the black & white mix take a color's hue
+    /// to weigh their bands.
+    ColorInput,
+}
 struct CurveSet {
+    /// Where the stage stops.
+    output: PixelOutput,
     exposure_gain: f32,
     /// Engine 4: Contrast, Whites and Blacks as measured Lightroom curves.
     basic_curves: bool,
@@ -420,19 +510,24 @@ struct CurveSet {
     /// The profile look's RGB table, at the recipe's Profile Amount.
     rgb_table: Option<crate::camera_profiles::RgbLook>,
     calibration: crate::develop::calibration::Calibration,
+    /// What Contrast and Whites follow of the photo, for the global sliders and the
+    /// masks' (engine 4).
+    photo: crate::develop::basic_tone::PhotoTone,
+    /// Engine 4's measured parametric curve, when the recipe uses it and a region is set.
+    parametric: Option<crate::develop::parametric::ParametricCurve>,
     master: CurveLut,
     channels: [CurveLut; 3],
 }
 impl CurveSet {
-    /// Curves plus, for engine 4, the Shadows/Highlights map of this image; built
-    /// also when `local_tone` (masks change Shadows or Highlights).
+    /// Curves plus, for engine 4, the Shadows/Highlights map of this image (which also
+    /// carries the measured Clarity); built also when `local_tone` (masks change
+    /// Shadows or Highlights).
     fn for_image(im: Source, r: &Recipe, matrix: [[f32; 3]; 3], local_tone: bool) -> Self {
-        let mut lut = Self::new(r);
+        let mut lut = Self::with_photo_measures(im, r, matrix);
         if lut.basic_curves {
             let local = crate::develop::local_tone::LocalToneMap::build(
                 im,
-                r.shadows,
-                r.highlights,
+                crate::develop::local_tone::Sliders::of(r),
                 local_tone,
                 |p| tone_stage(p, &im.metadata, r, &lut, matrix, None).0,
             );
@@ -440,9 +535,49 @@ impl CurveSet {
         }
         lut
     }
+    /// Curves with Contrast at this image's pivot and Whites for its highlights, when
+    /// the recipe measures them.
+    fn with_photo_measures(im: Source, r: &Recipe, matrix: [[f32; 3]; 3]) -> Self {
+        let mut lut = Self::new(r);
+        let (pivot, whites) = (measures_contrast_pivot(r), measures_whites(r));
+        if pivot {
+            lut.photo.contrast =
+                crate::develop::basic_tone::ContrastCurve::Pivot(contrast_pivot(im, r, matrix));
+        }
+        if whites {
+            lut.photo.whites = crate::develop::basic_tone::WhitesTable::for_highlights(
+                photo_highlights(im, r, matrix),
+            );
+        }
+        if pivot || whites {
+            lut.basic = crate::develop::basic_tone::BasicTone::new(
+                r.contrast,
+                r.whites,
+                r.blacks,
+                r.effects.dehaze,
+                &lut.photo,
+            );
+        }
+        lut
+    }
     fn new(r: &Recipe) -> Self {
         let basic_curves = r.engine >= 4 && r.reference_curves;
+        let photo = crate::develop::basic_tone::PhotoTone {
+            contrast: match r.contrast_model {
+                crate::develop::basic_tone::ContrastModel::Original => {
+                    crate::develop::basic_tone::ContrastCurve::Original
+                }
+                crate::develop::basic_tone::ContrastModel::Adaptive => {
+                    crate::develop::basic_tone::ContrastCurve::Pivot(
+                        crate::develop::basic_tone::TYPICAL_PIVOT,
+                    )
+                }
+            },
+            // Without the photo, adaptive Whites takes the original median curve.
+            whites: crate::develop::basic_tone::WhitesTable::original(),
+        };
         Self {
+            output: PixelOutput::Display,
             exposure_gain: 2f32.powf(r.exposure + r.camera_exposure),
             basic_curves,
             basic: basic_curves
@@ -452,10 +587,12 @@ impl CurveSet {
                         r.whites,
                         r.blacks,
                         r.effects.dehaze,
+                        &photo,
                     )
                 })
                 .flatten(),
             local: None,
+            photo,
             mixer: basic_curves
                 .then(|| crate::develop::color_mixer::ColorMixer::new(r))
                 .flatten(),
@@ -467,7 +604,7 @@ impl CurveSet {
                 .then(|| crate::develop::color_grade::ColorGrade::new(r))
                 .flatten(),
             black_ramp: basic_curves.then(|| {
-                ExposureRamp::new(DNG_SHADOWS_BLACK * 2f32.powf(r.exposure + r.camera_exposure))
+                ExposureRamp::new(default_black(r) * 2f32.powf(r.exposure + r.camera_exposure))
             }),
             rgb_table: r
                 .profile
@@ -482,11 +619,100 @@ impl CurveSet {
             calibration: crate::develop::calibration::Calibration::new(
                 r.effects.calibration,
                 r.effects.shadow_tint,
+                r.calibration_model,
             ),
+            parametric: (basic_curves && r.parametric_model.is_measured())
+                .then(|| parametric_curve(r))
+                .flatten(),
             master: CurveLut::new(&r.curve),
             channels: std::array::from_fn(|c| CurveLut::new(&r.effects.channels[c])),
         }
     }
+}
+/// The measured parametric curve: the user's regions, then (layered) a look's own
+/// curve at its Profile Amount, as Camera Raw applies it.
+fn parametric_curve(r: &Recipe) -> Option<crate::develop::parametric::ParametricCurve> {
+    use crate::develop::parametric::{ParametricCurve, ParametricModel};
+    let user = ParametricCurve::new(r.effects.parametric, r.effects.splits);
+    let look = r
+        .profile
+        .as_ref()
+        .filter(|_| r.parametric_model == ParametricModel::Layered)
+        .and_then(|p| p.enhanced.as_ref())
+        .and_then(|look| ParametricCurve::new(look.settings.parametric, look.settings.splits));
+    ParametricCurve::then(user, look)
+}
+/// Whether the recipe's Contrast pivots where the photo's own measure puts it.
+pub(crate) fn measures_contrast_pivot(r: &Recipe) -> bool {
+    r.engine >= 4
+        && r.reference_curves
+        && r.contrast_model == crate::develop::basic_tone::ContrastModel::Adaptive
+        && (r.contrast != 0.
+            || r.masks
+                .iter()
+                .any(|m| m.is_active() && m.adjust.contrast != 0.))
+}
+/// Whether the recipe's positive Whites follows the photo's highlights.
+pub(crate) fn measures_whites(r: &Recipe) -> bool {
+    r.engine >= 4
+        && r.reference_curves
+        && r.whites_model == crate::develop::basic_tone::WhitesModel::Adaptive
+        && (r.whites > 0.
+            || r.masks
+                .iter()
+                .any(|m| m.is_active() && m.adjust.whites > 0.))
+}
+/// The photo reduced for measuring it, without Clarity's and Texture's gain: a user
+/// adjustment that depends on the preview size.
+fn measured_copy(im: Source<'_>) -> std::borrow::Cow<'_, CameraImage> {
+    match (im.reduced, im.gain) {
+        (Some(small), None) => std::borrow::Cow::Borrowed(small),
+        _ => std::borrow::Cow::Owned(preview_source(
+            Source::new(im.image, None),
+            super::local_tone::MAP_EDGE,
+        )),
+    }
+}
+/// The highlights positive Whites follows: the 98th percentile of the encoded
+/// luminance of the photo's reduced copy as the recipe renders it before the Basic
+/// tone sliders, its Exposure included (measured on the chart).
+fn photo_highlights(im: Source, r: &Recipe, matrix: [[f32; 3]; 3]) -> f32 {
+    let small = measured_copy(im);
+    let lut = CurveSet::new(r);
+    let luminance: Vec<f32> = small
+        .pixels
+        .par_iter()
+        .map(|p| {
+            let rgb = tone_stage(*p, &im.metadata, r, &lut, matrix, None).0;
+            srgb_encode(super::local_tone::luminance(rgb).clamp(0., 1.))
+        })
+        .collect();
+    crate::develop::basic_tone::highlights(luminance)
+}
+/// Camera Raw's Contrast pivot for this photo, from its reduced copy rendered as the
+/// recipe's profile, white balance and calibration render it, at the camera's
+/// exposure: the user's Exposure does not move it (measured on the chart).
+fn contrast_pivot(im: Source, r: &Recipe, matrix: [[f32; 3]; 3]) -> f32 {
+    let small = measured_copy(im);
+    let default = Recipe {
+        exposure: 0.,
+        ..r.clone()
+    };
+    let lut = CurveSet::new(&default);
+    let encoded: Vec<[f32; 3]> = small
+        .pixels
+        .par_iter()
+        .map(|p| {
+            tone_stage(*p, &im.metadata, &default, &lut, matrix, None)
+                .0
+                .map(|v| srgb_encode(v.clamp(0., 1.)))
+        })
+        .collect();
+    crate::develop::basic_tone::photo_pivot(&crate::develop::basic_tone::blocks(
+        &encoded,
+        small.width as usize,
+        small.height as usize,
+    ))
 }
 fn apply_reference_curves(
     rgb: [f32; 3],
@@ -494,22 +720,12 @@ fn apply_reference_curves(
     lut: &CurveSet,
     local: Option<&LocalDelta>,
 ) -> [f32; 3] {
-    let p = mul(crate::camera_profiles::RGB_TO_PRO, rgb).map(|v| srgb_encode(v.clamp(0., 1.)));
-    let p = lut.basic.as_ref().map_or(p, |b| b.apply(p));
-    let p = match local {
-        Some(d) if local::uses(d, &local::TONE_SLOTS) => local::tone(d, p),
-        _ => p,
+    let p = curve_input(rgb, r, lut, local);
+    let p = match &lut.parametric {
+        Some(curve) => curve.apply(p),
+        // The original curve, the identity when no region is set.
+        None => p.map(|x| r.effects.parametric(x)),
     };
-    let contrast = if lut.basic_curves { 0. } else { r.contrast };
-    let p = p.map(|v| {
-        let x = ((v - r.black_point) / (r.white_point - r.black_point))
-            .clamp(0., 1.)
-            .powf(1. / r.midtone);
-        let power = 2f32.powf(contrast);
-        let low = x.powf(power);
-        r.effects
-            .parametric(low / (low + (1. - x).powf(power)).max(1e-8))
-    });
     let lo = p.into_iter().fold(f32::INFINITY, f32::min);
     let hi = p.into_iter().fold(0f32, f32::max);
     let a = lut.master.evaluate(lo);
@@ -522,6 +738,26 @@ fn apply_reference_curves(
     let master = refine_saturation(p, master, r.curve_saturation);
     let channels = std::array::from_fn(|c| srgb_decode(lut.channels[c].evaluate(master[c])));
     mul(crate::camera_profiles::PRO_TO_RGB, channels)
+}
+
+/// The parametric curve's input in each channel of encoded ProPhoto RGB: the basic
+/// tone curves, a mask's tone, Levels and (before engine 4) Contrast applied.
+fn curve_input(rgb: [f32; 3], r: &Recipe, lut: &CurveSet, local: Option<&LocalDelta>) -> [f32; 3] {
+    let p = mul(crate::camera_profiles::RGB_TO_PRO, rgb).map(|v| srgb_encode(v.clamp(0., 1.)));
+    let p = lut.basic.as_ref().map_or(p, |b| b.apply(p));
+    let p = match local {
+        Some(d) if local::uses(d, &local::TONE_SLOTS) => local::tone(d, p, &lut.photo),
+        _ => p,
+    };
+    let contrast = if lut.basic_curves { 0. } else { r.contrast };
+    p.map(|v| {
+        let x = ((v - r.black_point) / (r.white_point - r.black_point))
+            .clamp(0., 1.)
+            .powf(1. / r.midtone);
+        let power = 2f32.powf(contrast);
+        let low = x.powf(power);
+        low / (low + (1. - x).powf(power)).max(1e-8)
+    })
 }
 
 fn apply_curve(encoded: f32, c: usize, r: &Recipe, lut: &CurveSet) -> f32 {
@@ -804,6 +1040,14 @@ fn detail_sample(im: Source, x: f32, y: f32, r: &Recipe) -> [f32; 3] {
 /// Black level of the DNG SDK's exposure ramp at its default Shadows setting of 5
 /// (5 × 0.001, in scene-linear units before exposure).
 const DNG_SHADOWS_BLACK: f32 = 0.0015;
+/// The ramp's black before exposure: none under a profile whose DefaultBlackRender
+/// is None, as Camera Raw renders it.
+fn default_black(r: &Recipe) -> f32 {
+    match r.profile.as_ref().map(|p| p.black_render()) {
+        Some(crate::camera_profiles::BlackRender::None) => 0.,
+        _ => DNG_SHADOWS_BLACK,
+    }
+}
 /// dng_function_exposure_ramp with white at 1: values below `black` go to zero through
 /// a quadratic toe, the rest are stretched back to full range.
 struct ExposureRamp {
@@ -839,33 +1083,64 @@ impl ExposureRamp {
         }
     }
 }
-/// Built-in vignetting over the camera image. Radius 1 is the half diagonal; `x`, `y`
-/// use sample coordinates, where pixel `i` is centred at `i`.
+/// Vignetting over the camera image: the lens profile's at its Vignetting amount, and
+/// measured manual Vignetting. Radius 1 is the half diagonal; `x`, `y` use sample
+/// coordinates, where pixel `i` is centred at `i`.
 pub(crate) struct VignetteField<'a> {
-    lens: &'a crate::lens::LensCorrection,
+    table: VignetteTable<'a>,
     center: [f32; 2],
     half: f32,
-    /// Lightroom's profile Vignetting amount (1 = 100%).
+    /// The power the table is raised to: Lightroom's profile Vignetting amount (1 =
+    /// 100%), or 1 for a combined table, which holds it already.
     amount: f32,
+}
+enum VignetteTable<'a> {
+    Lens(&'a crate::lens::Radial),
+    Combined(crate::lens::Radial),
 }
 impl<'a> VignetteField<'a> {
     pub(crate) fn new(im: &'a CameraImage, r: &Recipe) -> Option<Self> {
         let lens = r
             .lens_correction(&im.metadata)
-            .filter(|l| l.vignetting.is_some())?;
+            .and_then(|l| l.vignetting.as_ref());
         let (w, h) = (im.width as f32, im.height as f32);
+        let half = (w * w + h * h).sqrt() * 0.5;
+        let (table, amount) = match (lens, r.manual_vignette()) {
+            (_, Some(manual)) => {
+                // Manual Vignetting spans the photo frame, inside the camera's default crop.
+                let inset = super::ImageFrame::new(im).inset;
+                let frame = (w * inset[2]).hypot(h * inset[3]) * 0.5;
+                (
+                    VignetteTable::Combined(super::effects::combined_table(
+                        lens,
+                        r.lens_vignetting,
+                        &manual,
+                        half / frame,
+                    )),
+                    1.,
+                )
+            }
+            (Some(lens), None) => (VignetteTable::Lens(lens), r.lens_vignetting),
+            (None, None) => return None,
+        };
         Some(Self {
-            lens,
+            table,
             center: [w * 0.5, h * 0.5],
-            half: (w * w + h * h).sqrt() * 0.5,
-            amount: r.lens_vignetting,
+            half,
+            amount,
         })
+    }
+    fn table(&self) -> &crate::lens::Radial {
+        match &self.table {
+            VignetteTable::Lens(t) => t,
+            VignetteTable::Combined(t) => t,
+        }
     }
     pub(crate) fn gain(&self, x: f32, y: f32) -> f32 {
         let dx = x + 0.5 - self.center[0];
         let dy = y + 0.5 - self.center[1];
-        self.lens
-            .vignetting_gain((dx * dx + dy * dy).sqrt() / self.half)
+        self.table()
+            .eval((dx * dx + dy * dy).sqrt() / self.half)
             .powf(self.amount)
     }
 }
@@ -941,8 +1216,7 @@ pub(crate) fn gpu_pixel_params(
         lum,
         [small.width, small.height],
         [im.width, im.height],
-        r.shadows,
-        r.highlights,
+        super::local_tone::Sliders::of(r),
     );
     Some(pixel_params::with_map(tone, &map))
 }
@@ -975,11 +1249,7 @@ pub(crate) fn lens_gpu_params(
         Some([red, blue]) => [push(Some(red)), push(Some(blue))],
         None => [[-1., 0.]; 2],
     };
-    let vignetting = push(
-        warp.vignetting
-            .as_ref()
-            .map(|v| v.lens.vignetting.as_ref().unwrap()),
-    );
+    let vignetting = push(warp.vignetting.as_ref().map(VignetteField::table));
     let m = &warp.map;
     // 2 marks a measured aberration, evaluated at the distorted radius.
     let mode = if m.chromatic.is_some() { 2. } else { 1. };
@@ -1043,11 +1313,11 @@ pub(crate) fn source_bounds(
     });
     [a.0, b.0, a.1 - a.0 + 1, b.1 - b.0 + 1]
 }
-/// Built-in vignetting for `gpu/logs.wgsl`: centre, half diagonal, amount and the
+/// Vignetting (lens profile and manual) for `gpu/logs.wgsl`: centre, half diagonal, amount and the
 /// radial table (knots, then values), or `None`.
 pub(crate) fn vignetting_gpu_params(im: &CameraImage, r: &Recipe) -> Option<([f32; 4], Vec<f32>)> {
     let v = VignetteField::new(im, r)?;
-    let radial = v.lens.vignetting.as_ref()?;
+    let radial = v.table();
     let mut table = radial.knots.clone();
     table.extend(&radial.values);
     Some(([v.center[0], v.center[1], v.half, v.amount], table))
@@ -1246,6 +1516,9 @@ pub(crate) fn mask_weights(
         };
         let mut plain = r.clone();
         plain.masks.clear();
+        // Range masks select from the photo as it renders, never as Visualize Range
+        // grays it.
+        crate::develop::point_color::without_visualization(&mut plain.point_colors);
         let im = toned.source();
         let gpu = stages.as_deref_mut().and_then(|s| {
             let params = pixel_params::pixel_params(im, &plain)?;
@@ -1377,9 +1650,36 @@ pub(crate) fn develop_samples(
     cancel: &std::sync::atomic::AtomicBool,
     weights: Option<&MaskWeights>,
 ) -> Result<Rendered> {
+    develop_samples_to(im, r, samples, cancel, weights, PixelOutput::Display)
+}
+/// `region` of the output as a dropper samples it at the stage `output` names,
+/// through the same sampling, lens correction, retouching and masks as the render.
+pub(crate) fn stage_samples(
+    toned: &Toned,
+    r: &Recipe,
+    g: &Geometry,
+    region: [u32; 4],
+    output: PixelOutput,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Rendered> {
+    let im = toned.source();
+    let samples = Arc::new(sample_region(im, r, g, region, 0., cancel)?);
+    let weights = mask_weights(toned, r, g, region, 0., Some(&samples), None, cancel)?;
+    let samples = detail(toned, r, samples, weights.as_deref(), None, cancel)?;
+    develop_samples_to(im, r, &samples, cancel, weights.as_deref(), output)
+}
+fn develop_samples_to(
+    im: Source,
+    r: &Recipe,
+    samples: &Samples,
+    cancel: &std::sync::atomic::AtomicBool,
+    weights: Option<&MaskWeights>,
+    output: PixelOutput,
+) -> Result<Rendered> {
     let matrix = profile_matrix(&im.metadata, r);
     let local_tone = weights.is_some_and(|w| w.uses(&[slot::SHADOWS, slot::HIGHLIGHTS]));
-    let lut = CurveSet::for_image(im, r, matrix, local_tone);
+    let mut lut = CurveSet::for_image(im, r, matrix, local_tone);
+    lut.output = output;
     let math = weights.map(|_| LocalMath::new(&im.metadata, r));
     let mut pixels = vec![[0.; 3]; samples.pixels.len()];
     pixels.par_iter_mut().enumerate().for_each(|(i, out)| {

@@ -7,7 +7,7 @@
 //!
 //! File formats, persistence and pixel processing belong in the domain modules.
 //! See `docs/code-map.md` for panel, library and worker implementation locations.
-use crate::app::worker::{Event, Latest, LoadJob, RenderJob};
+use crate::app::worker::{Event, Latest, LoadJob};
 #[cfg(test)]
 use crate::develop::Recipe;
 use eframe::egui::{self, Vec2};
@@ -30,7 +30,10 @@ pub struct Editor {
     tx: Sender<Event>,
     rx: Receiver<Event>,
     loader: Latest<LoadJob>,
-    renderer: Latest<RenderJob>,
+    renderer: worker::Renderer,
+    /// Develop's Reference View, and the worker developing its photo.
+    reference: reference::ReferenceView,
+    reference_loader: Latest<worker::ReferenceJob>,
     clipboard: Option<settings_transfer::Clipboard>,
     /// The settings of the photo open before this one, for Paste from Previous.
     previous_settings: Option<settings_transfer::Settings>,
@@ -39,8 +42,12 @@ pub struct Editor {
     copy_groups: crate::develop::settings_groups::GroupSelection,
     /// A preset made here being renamed.
     preset_rename: Option<user_presets::PresetRename>,
+    /// The Point Curve menu's saved curves and its Save window.
+    curves: curve_menu::CurveMenu,
     /// Collapsed panel sections as last saved to the session.
     collapsed: std::collections::BTreeSet<String>,
+    /// The sides in Solo Mode as last saved to the session.
+    solo: std::collections::BTreeSet<String>,
     onboarding: onboarding::Onboarding,
     onboarding_done: bool,
     preferences: preferences::Preferences,
@@ -87,6 +94,9 @@ pub struct Editor {
     /// Preferences > Raw Defaults, ready to apply; shared with the loader and the
     /// Library's previews.
     raw_defaults: std::sync::Arc<crate::develop::defaults::DevelopDefaults>,
+    /// Shared automation queue and independently configured input adapters.
+    controls: automation::Hub,
+    automation: commands::Automation,
 }
 impl Editor {
     pub fn new(
@@ -109,6 +119,7 @@ impl Editor {
             Some(crate::storage::data_dir().join("session.json")),
             worker::RenderBackend::Gpu(cc.wgpu_render_state.clone()),
         );
+        editor.controls = automation::Hub::start(&cc.egui_ctx);
         editor.updates.launched(launch, &mut editor.status);
         cc.egui_ctx
             .all_styles_mut(|style| text.apply_to_visuals(&mut style.visuals));
@@ -141,7 +152,8 @@ impl Editor {
         // Cmd/Ctrl + and − zoom the photo, not the whole interface.
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
         ctx.data_mut(|d| {
-            d.insert_temp(widgets::collapsed_sections_id(), session.collapsed.clone())
+            d.insert_temp(widgets::collapsed_sections_id(), session.collapsed.clone());
+            d.insert_temp(widgets::solo_sections_id(), session.solo.clone());
         });
         ctx.all_styles_mut(|style| {
             style.spacing.item_spacing = Vec2::new(8., 5.);
@@ -193,6 +205,7 @@ impl Editor {
         let (tx, rx) = mpsc::channel();
         let loader = worker::loader(tx.clone(), ctx.clone());
         let renderer = worker::renderer_with_backend(tx.clone(), ctx.clone(), backend);
+        let reference_loader = worker::reference_loader(tx.clone(), ctx.clone());
         let mut app = Self {
             activity: Default::default(),
             load: Default::default(),
@@ -215,12 +228,16 @@ impl Editor {
             rx,
             loader,
             renderer,
+            reference: Default::default(),
+            reference_loader,
             clipboard: None,
             previous_settings: None,
             copy_dialog: None,
             preset_rename: None,
+            curves: Default::default(),
             copy_groups: session.copy_groups.clone().unwrap_or_default(),
             collapsed: session.collapsed.clone(),
+            solo: session.solo.clone(),
             onboarding: onboarding::Onboarding::new(show_onboarding),
             onboarding_done: session.onboarding_done,
             preferences: Default::default(),
@@ -266,6 +283,8 @@ impl Editor {
             raw_defaults: std::sync::Arc::new(crate::develop::defaults::DevelopDefaults::load(
                 session.raw_defaults.clone(),
             )),
+            controls: automation::Hub::inactive(),
+            automation: commands::Automation::default(),
         };
         app.reload_presets(ctx);
         // A catalog passed on the command line opens instead of the last one;
@@ -292,6 +311,7 @@ impl Editor {
                     last_path: self.session_path(),
                     monitor: self.view.monitor.clone(),
                     collapsed: self.collapsed.clone(),
+                    solo: self.solo.clone(),
                     onboarding_done: self.onboarding_done,
                     library_source: self.saved_place.0.clone(),
                     selected_photo: self.saved_place.1,
@@ -414,10 +434,16 @@ fn survive_surface_errors(device: &wgpu::Device) {
 }
 
 mod auto;
+mod automation;
+mod before_after;
+mod brush_scroll;
 mod bulk_import;
 mod catalog;
 mod clipping;
+mod color_grading;
+mod commands;
 mod crop_tool;
+mod curve_menu;
 mod dialogs;
 mod export;
 mod guided_tool;
@@ -428,13 +454,18 @@ mod navigator;
 mod onboarding;
 mod overlay;
 mod photo_metadata;
+mod point_color_panel;
 mod preferences;
 mod presets;
 mod raw_defaults;
+mod readout;
 mod red_eye_tool;
+mod reference;
 mod retouch_tool;
 #[cfg(feature = "telemetry")]
 mod stats;
+mod stroke_outline;
+mod targeted_tool;
 #[cfg(test)]
 mod tests;
 mod undo;

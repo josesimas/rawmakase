@@ -87,6 +87,14 @@ Lightroom's manual Distortion (Lens Corrections > Manual, `crs:LensManualDistort
 
 The `lens-manual-distortion*` corpus cases (±50, and +50 with Vertical +30) sit at mean ΔE00 1.3–1.7 from Camera Raw (the default render is 0.9), against 16–21 if it were ignored. The Lens Corrections panel's Distortion › Amount slider sets it, from process version 4. Constrain Crop crops the white out ([transform](transform.md#constrain-crop)).
 
+## Manual vignetting
+
+Lens Corrections > Manual > Vignetting (`crs:VignetteAmount`, `VignetteMidpoint`) follows Camera Raw 18.7, measured on flat synthetic DNGs at three brightnesses, a 3:2 and a square frame, and four crops (`effects::lens_vignette`). Camera Raw multiplies scene-linear light by a radial gain over the whole photo, before the tone curve: the crop neither moves nor resizes it, and the gain is the same at every brightness. Positive amounts lighten the corners. With `r` the distance from the centre over the half diagonal, `ln gain = amount × c·r^p / (1 + k·r^p)`, where Midpoint (0–100) raises `p` from 2.1 to 9.8 and moves `c` and `k` a little. The fit's log error is 0.018 RMS over 32 renders.
+
+RAWmakase applies it while sampling the camera image, in one table with the lens profile's vignetting (on the GPU as well), so it also works without lens data. On the chart cases `lens-vignetting-50`, `+50` and `-50-midpoint20`, mean ΔE00 to Camera Raw went from about 5.1 (7.5 at Midpoint 20) to 0.8–1.0, the default render's own distance. Before, RAWmakase darkened the finished pixels inside the crop with the opposite sign: `Recipe::lens_vignette_model` keeps that operator (`Original`, the default when the field is missing) for recipes saved before, and new edits and imports are `Measured`. Copying Lens Vignetting copies the model with the sliders. An old recipe takes the measured operator when its Amount is moved from 0 or a Lightroom XMP or preset sets Vignetting, since nothing of the original operator is then kept.
+
+The radius is measured on the photo frame, the camera's default crop; the gain shares the lens table's centre, the decoded image's, so a default crop off the sensor's centre is approximated there.
+
 ## Defringe
 
 Lightroom's Defringe (`crs:DefringePurpleAmount`, `…GreenAmount` and their Hue ranges) reduces the chroma of hues inside the Purple and Green ranges. `Effects::defringe_color` does it per pixel in Oklab, after the colour controls:
@@ -104,8 +112,22 @@ A DNG records the corrections Lightroom applies to its raw image. `src/dng.rs` r
 
 ## Adobe LCP profiles
 
-Lightroom's Enable Profile Corrections uses an Adobe lens profile. RAWmakase reads the same `.lcp` files when the user imports them (`rawmakase import-lens-profiles FILE…`, or the app's import command); they are copied to `lens-profiles` in the data directory and never read from a Lightroom installation. `src/lens/lcp.rs` matches the photo's lens model, preferring raw profiles and profiles made on the photo's camera make, then on a make sharing the lens mount, as Adobe profiles some third-party lenses on one body only, and interpolates the model in focal length and aperture, taking the farthest focus distance. It converts distortion, vignetting and chromatic models to the correction above. When the profile sets PreferMetadataDistort, the camera's own distortion is kept, as Lightroom does.
+Lightroom's Enable Profile Corrections uses an Adobe lens profile. RAWmakase reads the same `.lcp` files when the user imports them (`rawmakase import-lens-profiles FILE…`, or the app's import command); they are copied to `lens-profiles` in the data directory and never read from a Lightroom installation. Each file is imported on its own, so a file without usable entries (Adobe ships a few) is listed as skipped and the rest still import. `src/lens/lcp.rs` matches the photo's lens model, preferring raw profiles and profiles made on the photo's camera make, then on a make sharing the lens mount, as Adobe profiles some third-party lenses on one body only, and interpolates the model in focal length and aperture, taking the farthest focus distance. It converts distortion, vignetting and chromatic models to the correction above. When the profile sets PreferMetadataDistort, the camera's own distortion is kept, as Lightroom does.
 
-`Recipe::lens_profile` enables it, from `crs:LensProfileEnable`. `lens_distortion` and `lens_vignetting` are the profile's Distortion and Vignetting amounts (`crs:LensProfileDistortionScale` / `VignettingScale`, 0–200%). With a matching imported profile, the profile replaces the built-in correction. Without one, the built-in correction applies when `lens_builtin` is set.
+`Recipe::lens_profile` enables it, from `crs:LensProfileEnable`. `lens_distortion` and `lens_vignetting` are the profile's Distortion and Vignetting amounts (`crs:LensProfileDistortionScale` / `VignettingScale`, 0–200%): the distortion's radial scale moves from none at 0 to twice the profile's at 200, and the vignetting gain is raised to the amount (0 none, 200 the gain squared). With an imported profile in use, the profile replaces the built-in correction. Without one, the built-in correction applies when `lens_builtin` is set.
+
+### Choosing a profile
+
+The Lens Corrections panel's Profile part has Lightroom's Setup, Make, Model and Profile menus. They list the imported profiles that fit the photo's camera (`lcp::PhotoProfiles`, rebuilt when a photo opens): profiles with an entry whose sensor covers the camera's, raw profiles in place of non-raw ones for the same lens. A profile is one imported `.lcp` file. Make and Model come from its `LensPrettyName` (the first word is the lens maker), the Profile item is its `ProfileName`.
+
+`Recipe::lens_profile_choice` holds the Setup and the profile the edit names (`lens::choice`), from and to `crs:LensProfileSetup` (`LensDefaults`, `Auto`, `Custom`), `LensProfileName`, `LensProfileFilename` and `LensProfileDigest`:
+
+- **Default** and **Auto** use the imported profile of the photo's lens made on the same camera make, else on a make sharing the mount, else on any make. RAWmakase keeps no saved lens defaults, so Default matches as Auto does, as Lightroom does for a lens without one. A profile the edit names is used instead when it is imported and profiles this lens.
+- **Custom** uses the profile the edit names, whatever lens it was made for, as for an adapted or manual lens. Picking a make, model or profile sets Custom; picking Default or Auto forgets the named profile and matches again.
+- A named profile is found by its file name, ignoring case, or by profile name when the edit records no file name; another file with the same profile name does not stand in for a recorded one. One that isn't imported is kept in the edit, written back to exports, and reported in the import notice and under the menus: `Lens profile "…" isn't imported; using …`, with the matched profile (Default, Auto), the built-in correction or no correction.
+- An edit whose profile is the one the RAW carries (`LensProfileIsEmbedded`, which Adobe names "Camera Settings") renders the built-in correction, even when a matching LCP is imported, and says so when the file has none.
+- `LensProfileDigest` is kept as read and written back with the same file; RAWmakase does not compute Adobe's digest, so a profile picked here is written without one.
+
+Constrain Crop and the profile do not interact: the profile's distortion is scaled to stay inside the photo at every amount, and Constrain Crop crops what Upright, the Transform sliders and manual Distortion uncover after it. Switching the panel off renders no profile and keeps the choice.
 
 Against Camera Raw 18.6 renders with profile corrections on (8 A7 II photos, FE 55mm F1.8 ZA at f/1.8), RAWmakase with the imported Adobe profile averages 0.0088 MAE, with centre and corner exposure within ±0.02 EV. Without correction the corners were 1 EV darker.

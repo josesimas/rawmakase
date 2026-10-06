@@ -26,10 +26,14 @@ pub(super) struct Document {
     pub(super) lightroom_notice: String,
     /// Lightroom's history for the open catalog photo, oldest first.
     pub(super) lightroom_history: Vec<crate::catalog::HistoryStep>,
+    /// What Before shows when not the photo's starting settings: a History step,
+    /// snapshot or the edit copied to it. Not saved, as in Lightroom.
+    pub(super) before: Option<Recipe>,
     /// The open catalog photo's Snapshots.
     pub(super) snapshots: super::snapshots::Snapshots,
-    /// Apply the photo's Lightroom settings once its profiles arrive.
-    pub(super) pending_lightroom: bool,
+    /// The photo's Lightroom settings, as read with its edit, to apply once its
+    /// profiles arrive.
+    pub(super) pending_lightroom: Option<String>,
     /// Where the edit on screen started from.
     pub(super) origin: EditOrigin,
     /// The raw defaults for this photo, once its profiles are known: what Reset
@@ -39,6 +43,10 @@ pub(super) struct Document {
     pub(super) profile_errors: Vec<String>,
     /// The Auto estimate for this photo; dropping it with the document cancels it.
     pub(super) auto: super::task::Task,
+    /// Point Color's dropper sampling the photo, off the UI thread.
+    pub(super) point_color_pick: super::task::Task,
+    /// The Targeted Adjustment Tool sampling the photo where a drag started.
+    pub(super) targeted_pick: super::task::Task,
     /// What the running estimate measures: the recipe without the settings Auto sets.
     pub(super) auto_input: Option<Recipe>,
     /// The recipe as Auto last left it; while it is unchanged, Auto has nothing to do.
@@ -160,6 +168,8 @@ pub(super) struct PreviewState {
     /// crop lands, the old one is placed where its crop sits instead of stretched.
     pub(super) crop: Option<[f32; 4]>,
     pub(super) pending_crop: [f32; 4],
+    /// Before's render, while it shows beside the edit.
+    pub(super) before: super::before_after::BeforePreview,
 }
 impl Default for PreviewState {
     fn default() -> Self {
@@ -181,6 +191,7 @@ impl Default for PreviewState {
             pending_mode: TextureMode::Whole,
             crop: None,
             pending_crop: [0., 0., 1., 1.],
+            before: Default::default(),
         }
     }
 }
@@ -195,6 +206,8 @@ pub(super) enum Tool {
     WhiteBalance,
     /// Defringe's Fringe Color Selector.
     Defringe,
+    /// Point Color's dropper, which adds a swatch.
+    PointColor,
     /// Spot removal: Heal and Clone.
     Remove,
     /// Red Eye Correction.
@@ -202,14 +215,37 @@ pub(super) enum Tool {
     Mask,
     /// The Transform panel's Guided Upright tool.
     Guided,
+    /// The Targeted Adjustment Tool of the Tone Curve, the Color Mixer or B&W.
+    Targeted(crate::develop::targeted::Target),
+}
+/// The Color Mixer's tabs, as in Lightroom.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum MixerTab {
+    #[default]
+    Mixer,
+    PointColor,
+}
+/// Point Color's panel: the selected swatch and the view options.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct PointColorView {
+    pub(super) selected: Option<usize>,
+    /// Visualize Range: the selected swatch's selection in color, the rest gray.
+    pub(super) visualize: bool,
+    /// The Hue, Saturation and Luminance range controls are shown.
+    pub(super) ranges: bool,
 }
 pub(super) struct ViewState {
     /// Fit or a zoom level, and where; Develop's and the Library's.
     pub(super) zoom: super::navigator::Zoom,
+    /// The size, in pixels, of the area the edit is shown in: the viewport, or its
+    /// half beside Before.
     pub(super) viewport: Vec2,
-    pub(super) compare: bool,
+    /// Before alone or beside the edit.
+    pub(super) compare: super::before_after::Compare,
     /// The histogram's clipping warnings.
     pub(super) clipping: super::clipping::ClippingView,
+    /// The RGB values under the pointer, shown under the histogram.
+    pub(super) readout: super::readout::Readout,
     /// A drag in the histogram in progress.
     pub(super) tone_drag: Option<super::tone_drag::ToneDrag>,
     pub(super) tool: Tool,
@@ -227,17 +263,25 @@ pub(super) struct ViewState {
     pub(super) retouch: super::retouch_tool::RetouchTool,
     /// Red Eye Correction's selection, last size and drag in progress.
     pub(super) red_eye: super::red_eye_tool::RedEyeTool,
+    /// A wheel scroll sizing a brush, recorded as one History step when it pauses.
+    pub(super) wheel: super::brush_scroll::WheelGesture,
     /// Masking panel state.
     pub(super) masking: super::mask_tool::MaskTool,
     /// The Guided Upright tool's selection, drag and view options.
     pub(super) guided: super::guided_tool::GuidedTool,
     pub(super) monitor: Option<PathBuf>,
     pub(super) selected_band: usize,
-    pub(super) selected_grade: usize,
+    /// The Color Grading panel's view: 3-Way or one wheel.
+    pub(super) grading: super::color_grading::GradingView,
     pub(super) selected_curve: usize,
     pub(super) parametric_curve: bool,
     pub(super) mixer_color: bool,
     pub(super) mixer_adjust: usize,
+    /// The Color Mixer's tab: the mixer or Point Color.
+    pub(super) mixer_tab: MixerTab,
+    pub(super) point_color: PointColorView,
+    /// A Targeted Adjustment Tool drag in progress.
+    pub(super) targeted: Option<super::targeted_tool::TargetDrag>,
     pub(super) shortcuts: bool,
     pub(super) zoom_key: (bool, f32),
     pub(super) zoom_anim: Option<(f64, egui::Rect)>,
@@ -248,8 +292,9 @@ impl Default for ViewState {
         Self {
             zoom: Default::default(),
             viewport: Vec2::ZERO,
-            compare: false,
+            compare: Default::default(),
             clipping: Default::default(),
+            readout: Default::default(),
             tone_drag: None,
             tool: Tool::None,
             crop_drag: None,
@@ -260,15 +305,19 @@ impl Default for ViewState {
             ruler: Default::default(),
             retouch: Default::default(),
             red_eye: Default::default(),
+            wheel: Default::default(),
             masking: Default::default(),
             guided: Default::default(),
             monitor: None,
             selected_band: 0,
-            selected_grade: 1,
+            grading: Default::default(),
             selected_curve: 0,
             parametric_curve: false,
             mixer_color: false,
             mixer_adjust: 0,
+            mixer_tab: MixerTab::Mixer,
+            point_color: Default::default(),
+            targeted: None,
             shortcuts: false,
             zoom_key: (false, 1.),
             zoom_anim: None,
@@ -296,6 +345,8 @@ pub(super) struct PresetBrowser {
     pub(super) revision: u64,
     /// Numbers library scans, so only the latest one is shown.
     pub(super) scans: u64,
+    /// The Amount of the preset just applied, while nothing else has changed.
+    pub(super) amount: Option<super::presets::AmountSession>,
 }
 
 impl PresetBrowser {
@@ -330,20 +381,39 @@ impl PreviewState {
         self.last_region = None;
         self.mode = TextureMode::Whole;
         self.crop = None;
+        self.before.clear();
+        // The pixels the readout and loupes read belong to the photo left.
+        self.samples = None;
+        self.region_samples = None;
+        self.samples_recipe = None;
+        self.samples_requested = false;
     }
     /// Textures the renderer presented into that the viewport draws.
     pub fn presented(&self) -> Vec<egui::TextureId> {
-        [&self.texture, &self.region, &self.navigator]
-            .into_iter()
-            .flatten()
-            .filter(|p| p.is_presented())
-            .map(Picture::id)
-            .collect()
+        [
+            &self.texture,
+            &self.region,
+            &self.navigator,
+            &self.before.texture,
+            &self.before.region,
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|p| p.is_presented())
+        .map(Picture::id)
+        .collect()
     }
     /// Stops drawing textures the renderer presented into, once it has freed them.
     /// Not rendering again at once: a render that keeps failing would repeat.
     pub fn forget_presented(&mut self) {
-        for slot in [&mut self.texture, &mut self.region, &mut self.navigator] {
+        let [before, before_region] = self.before.pictures();
+        for slot in [
+            &mut self.texture,
+            &mut self.region,
+            &mut self.navigator,
+            before,
+            before_region,
+        ] {
             if slot.as_ref().is_some_and(Picture::is_presented) {
                 *slot = None;
             }
@@ -354,9 +424,21 @@ impl ViewState {
     pub fn is(&self, tool: Tool) -> bool {
         self.tool == tool
     }
-    /// An eyedropper is active: the White Balance or Fringe Color Selector.
+    /// An eyedropper is active: White Balance, the Fringe Color Selector or Point
+    /// Color's dropper.
     pub fn picks_color(&self) -> bool {
-        matches!(self.tool, Tool::WhiteBalance | Tool::Defringe)
+        matches!(
+            self.tool,
+            Tool::WhiteBalance | Tool::Defringe | Tool::PointColor
+        )
+    }
+    /// What the eyedropper's loupe asks for.
+    pub fn loupe_prompt(&self) -> &'static str {
+        match self.tool {
+            Tool::Defringe => "Pick a purple or green fringe",
+            Tool::PointColor => "Pick a color to adjust",
+            _ => "Pick a target neutral",
+        }
     }
     /// Opens `tool`, or closes it when it is already open.
     pub fn toggle(&mut self, tool: Tool) {
@@ -373,6 +455,8 @@ impl ViewState {
         self.zoom_anim = None;
         self.shown_rect = None;
         self.tool = Tool::None;
+        self.point_color.selected = None;
+        self.targeted = None;
         self.crop_drag = None;
         self.ruler = Default::default();
         // Ends a histogram drag: the next photo starts from its own values.
@@ -381,7 +465,13 @@ impl ViewState {
         self.red_eye.clear_document();
         self.masking.clear_document();
         self.guided.clear_document();
-        self.compare = false;
+        // The next photo's values come with its first render.
+        self.readout.values = None;
+        // Before alone is left with the photo; Before beside the edit stays, as
+        // Lightroom keeps its Before/After view from photo to photo.
+        if self.compare.before_only() {
+            self.compare = Default::default();
+        }
     }
 }
 impl PresetBrowser {
@@ -392,6 +482,7 @@ impl PresetBrowser {
         self.selected.clear();
         self.preview = None;
         self.hover = None;
+        self.amount = None;
     }
 }
 

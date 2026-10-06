@@ -252,6 +252,22 @@ impl History {
             .collect();
         (steps, self.undo.len())
     }
+    /// The edit at a History state, done or undone: `applied` steps applied, counted
+    /// as `steps` lists them (0 is the oldest state kept), with `current` the state
+    /// applied now. For Copy History Step Settings to Before.
+    pub fn state(&self, applied: usize, current: &Recipe) -> Option<Recipe> {
+        let now = self.undo.len();
+        match applied.cmp(&now) {
+            std::cmp::Ordering::Less => Some(self.undo[applied].0.clone()),
+            std::cmp::Ordering::Equal => Some(current.clone()),
+            std::cmp::Ordering::Greater => self
+                .redo
+                .iter()
+                .rev()
+                .nth(applied - now - 1)
+                .map(|(r, _)| r.clone()),
+        }
+    }
     /// Undoes or redoes until `applied` steps are applied, as clicking a
     /// History step in Lightroom does. Later steps stay until a new edit.
     pub fn go_to(&mut self, applied: usize, current: &mut Recipe) -> bool {
@@ -282,6 +298,10 @@ impl History {
         if let Some(before) = self.gesture.take() {
             self.record(before, current);
         }
+    }
+    /// Undo, redo or a History click changed the recipe this frame, not an edit.
+    pub fn is_replaying(&self) -> bool {
+        self.replaying
     }
     pub fn begin_frame(&mut self) {
         self.replaying = false;
@@ -410,10 +430,9 @@ fn describe(before: &Recipe, after: &Recipe) -> Step {
         || a.effects.parametric != b.effects.parametric
     {
         "Tone Curve"
-    } else if a.hsl != b.hsl
-        || a.point_colors != b.point_colors
-        || a.effects.gray_mix != b.effects.gray_mix
-    {
+    } else if a.point_colors != b.point_colors {
+        "Point Color"
+    } else if a.hsl != b.hsl || a.effects.gray_mix != b.effects.gray_mix {
         "HSL / Color"
     } else if a.grading != b.grading || a.effects.global_grade != b.effects.global_grade {
         "Color Grading"
@@ -437,12 +456,43 @@ fn describe(before: &Recipe, after: &Recipe) -> Step {
         return Step::new(red_eye_step(b, a), "");
     } else if a.masks != b.masks {
         return mask_step(b, a);
+    } else if a.panels != b.panels {
+        return panel_switch_step(b, a);
     } else {
         "Edit"
     };
     Step::new(name, "")
 }
 
+/// Lightroom names a panel switch "Enable Tone Curve", "Yes" or "No".
+fn panel_switch_step(before: &Recipe, after: &Recipe) -> Step {
+    use crate::develop::panels::{Panel, PanelState};
+    let Some(panel) = Panel::ALL
+        .into_iter()
+        .find(|p| after.panels.state(*p) != before.panels.state(*p))
+    else {
+        return Step::new("Edit", "");
+    };
+    let name = match panel {
+        Panel::ToneCurve => "Tone Curve",
+        Panel::ColorMixer => "Color Adjustments",
+        Panel::BlackWhiteMix => "Grayscale Mix",
+        Panel::ColorGrading => "Color Grading",
+        Panel::Detail => "Detail",
+        Panel::LensCorrections => "Lens Corrections",
+        Panel::Transform => "Transform",
+        Panel::Effects => "Effects",
+        Panel::Calibration => "Calibration",
+        Panel::SpotRemoval => "Spot Removal",
+        Panel::RedEye => "Red Eye",
+        Panel::Masks => "Masks",
+    };
+    let value = match after.panels.state(panel) {
+        PanelState::On => "Yes",
+        PanelState::Off => "No",
+    };
+    Step::new(format!("Enable {name}"), value)
+}
 /// Lightroom names red eye edits by what happened and the type: "Add Red Eye
 /// Correction", "Update Pet Eye Correction", "Delete Red Eye Correction".
 fn red_eye_step(before: &Recipe, after: &Recipe) -> String {
@@ -529,6 +579,31 @@ fn mask_step(before: &Recipe, after: &Recipe) -> Step {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_panel_switch_is_one_step_named_as_lightroom_names_it() {
+        use crate::develop::panels::{Panel, PanelState};
+        let mut history = History::default();
+        let mut recipe = Recipe::default();
+        let before = recipe.clone();
+        recipe.panels.set(Panel::ToneCurve, PanelState::Off);
+        history.record(before, &recipe);
+        assert_eq!(history.undo.len(), 1);
+        let step = &history.undo[0].1;
+        assert_eq!(
+            (step.name.as_str(), step.value.as_str()),
+            ("Enable Tone Curve", "No")
+        );
+        let off = recipe.clone();
+        recipe.panels.set(Panel::ColorMixer, PanelState::Off);
+        assert_eq!(
+            describe(&off, &recipe),
+            Step::new("Enable Color Adjustments", "No")
+        );
+        assert_eq!(
+            describe(&recipe, &off),
+            Step::new("Enable Color Adjustments", "Yes")
+        );
+    }
     #[test]
     fn drag_is_one_undo_step_and_replay_does_not_record_itself() {
         let mut history = History::default();
@@ -701,6 +776,27 @@ mod tests {
         let mut current = pasted.clone();
         assert!(restored.undo(&mut current));
         assert_eq!(current, recipe);
+    }
+    #[test]
+    fn each_state_reads_back_done_or_undone_without_moving() {
+        let mut history = History::default();
+        let mut recipe = Recipe::default();
+        let mut states = vec![recipe.clone()];
+        for value in [0.5, 1., 1.5] {
+            let before = recipe.clone();
+            recipe.exposure = value;
+            history.record(before, &recipe);
+            states.push(recipe.clone());
+        }
+        history.undo(&mut recipe);
+        let shown = recipe.clone();
+        for (applied, state) in states.iter().enumerate() {
+            assert_eq!(history.state(applied, &recipe).as_ref(), Some(state));
+        }
+        assert_eq!(history.state(4, &recipe), None);
+        // Reading a state changes neither the edit nor where History is.
+        assert_eq!(recipe, shown);
+        assert_eq!(history.steps().1, 2);
     }
     #[test]
     fn steps_are_named_and_go_to_moves_between_them() {

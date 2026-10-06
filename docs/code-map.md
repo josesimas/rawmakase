@@ -35,6 +35,7 @@ remain private to their domain. This is one Rust package, not a multi-crate work
 | [src/color_math.rs](../src/color_math.rs) | Private shared matrix and sRGB transfer primitives. |
 | [src/comparison.rs](../src/comparison.rs) | Reference-image comparisons and reproducible resolved-recipe output using the normal development APIs. |
 | [src/demosaic.rs](../src/demosaic.rs) | RAWmakase's own demosaicing of the unpacked sensor data (Bayer and X-Trans); LibRaw's is the fallback. See [demosaicing](demosaic.md). |
+| [src/cameras.rs](../src/cameras.rs) | The camera table, [data/cameras.toml](../data/cameras.toml): per-model baseline exposure, with the same-make fallback. See [camera table](cameras.md). |
 | [src/dng.rs](../src/dng.rs) | The rendering hints a DNG carries: embedded camera profile, baseline exposure, default crop and opcode lens corrections. |
 | [src/tiff.rs](../src/tiff.rs) | Minimal bounded TIFF directory reader for RAW containers (ARW, DNG, the TIFF inside RAF), and the TIFF field types. |
 | [src/jpeg.rs](../src/jpeg.rs) | Walks a JPEG's marker segments up to the image data: embedded XMP and EXIF, and where an export inserts its XMP. |
@@ -50,7 +51,7 @@ remain private to their domain. This is one Rust package, not a multi-crate work
 | --- | --- |
 | [develop/mod.rs](../src/develop/mod.rs) | Public rendering API and exports of `Recipe`, `Geometry` and `Rendered`. |
 | [recipe.rs](../src/develop/recipe.rs) | Serialized adjustment model, defaults, validation, rendering-engine compatibility and profile selection. |
-| [defaults.rs](../src/develop/defaults.rs) | Raw defaults: the master and per-camera choices (Adobe Default, RAWmakase Default or a preset), and resolving a photo's starting settings with a fallback note. See [raw defaults](xmp-presets.md#raw-defaults). |
+| [defaults.rs](../src/develop/defaults.rs) | Raw defaults: the master and per-camera choices (Adobe Default, Camera Settings, RAWmakase Default or a preset), and resolving a photo's starting settings with a fallback note. See [raw defaults](xmp-presets.md#raw-defaults). |
 | [geometry.rs](../src/develop/geometry.rs) | Crop, orientation, rotation, flips, straighten, output sizing and coordinate mapping. |
 | [orientation.rs](../src/develop/orientation.rs) | Rotate and Flip on the photo as shown, keeping the crop and straightening on the same part of the photo. |
 | [image_space.rs](../src/develop/image_space.rs) | Image space, where spots and masks keep positions (oriented photo before lens correction, Transform and crop), and its mapping to and from the view, including the lens distortion inverse. |
@@ -68,13 +69,15 @@ remain private to their domain. This is one Rust package, not a multi-crate work
 | [masks/local.rs](../src/develop/masks/local.rs) | A mask's sliders as per-pixel deltas, and where each acts in the pipeline. |
 | [pipeline.rs](../src/develop/pipeline.rs) | Color/tone processing, sampling, render entry points, neutral picking and legacy engine paths. |
 | [basic_tone.rs](../src/develop/basic_tone.rs), [basic_tone_data.rs](../src/develop/basic_tone_data.rs) | Engine 4 Contrast, Whites, Blacks and Dehaze as measured Camera Raw curves, and the measured tables. See [tone controls](tone-controls.md). |
+| [parametric.rs](../src/develop/parametric.rs), [parametric.bin](../src/develop/parametric.bin) | Engine 4 parametric tone curve (Shadows, Darks, Lights, Highlights and the splits) as measured Camera Raw curves, and the measured tables. See [tone controls](tone-controls.md#parametric-curve). |
 | [local_tone.rs](../src/develop/local_tone.rs), [local_tone_data.rs](../src/develop/local_tone_data.rs) | Engine 4 Shadows and Highlights: an edge-aware local operator fitted to Camera Raw, and its tables. |
 | [color_mixer.rs](../src/develop/color_mixer.rs), [color_mixer.bin](../src/develop/color_mixer.bin) | Engine 4 HSL mixer, Saturation and Vibrance as measured hue/saturation/value lookups. See [color mixer](color-mixer.md). |
 | [point_color.rs](../src/develop/point_color.rs) | Point Color swatches as Camera Raw stores them, their validation and text form for XMP and catalogs, and the fitted operator in HSV of linear ProPhoto RGB (`develop.wgsl`'s `point_colors` on the GPU). See [color mixer](color-mixer.md#point-color). |
-| [color_grade.rs](../src/develop/color_grade.rs), [color_grade_data.rs](../src/develop/color_grade_data.rs) | Engine 4 color grading as measured per-luminance gains, and its tables. |
+| [color_grade.rs](../src/develop/color_grade.rs), [color_grade_curves.rs](../src/develop/color_grade_curves.rs), [color_grade_data.rs](../src/develop/color_grade_data.rs) | Engine 4 color grading: Camera Raw 18.7's per-channel curves (`color_grade_curves.bin`) for current recipes, and the earlier per-luminance gains that older recipes keep. |
 | [upright.rs](../src/develop/upright.rs) | Upright analysis: vanishing points from straight lines, giving Level, Vertical, Full and Auto, and the Crop panel's Auto straighten angle. See [transform](transform.md). |
 | [guided.rs](../src/develop/guided.rs) | Guided Upright: solving two to four guides into a correction, and what to say when they can't. See [transform](transform.md#guided-upright). |
-| [quality.rs](../src/develop/quality.rs) | Full-quality detail/spatial processing, resizing and cancellable fit/region rendering. |
+| [quality.rs](../src/develop/quality.rs) | Full-quality detail/spatial processing, resizing and cancellable fit/region rendering; the Point Color and Targeted Adjustment samples. |
+| [targeted.rs](../src/develop/targeted.rs) | The Targeted Adjustment Tool's targets, and how a drag is shared among the sliders for a sampled color. |
 | [preview_renderer.rs](../src/develop/preview_renderer.rs) | Stateful preview backend selection, the photo's resolution pyramid, GPU diagnostics and CPU fallback. |
 | [pyramid.rs](../src/develop/pyramid.rs) | Resolution pyramid of the recovered (and retouched) camera image for Fit and zoomed-out previews; patched where spot removal changed. |
 | [stage_cache.rs](../src/develop/stage_cache.rs) | Preview cache of local-tone blurs, local-tone images, geometry samples, mask weights and brush rasters, keyed by the recipe fields each stage reads. |
@@ -93,7 +96,7 @@ remain private to their domain. This is one Rust package, not a multi-crate work
 | [calibration.rs](../src/develop/calibration.rs) | Camera-primary calibration and shadow tint. |
 | [white_balance.rs](../src/develop/white_balance.rs) | Fallback illuminant and as-shot temperature estimation. |
 | [black_white.rs](../src/develop/black_white.rs) | Treatment (Color or Black & White, kept with black & white profiles) and the Auto black & white mix, fitted to Camera Raw's Auto. See [color mixer](color-mixer.md#black--white). |
-| [auto.rs](../src/develop/auto.rs) | Auto: the Basic tone sliders and Vibrance predicted from a reduced render of the photo by fits to Lightroom's Auto values, and white balance from gray world. |
+| [auto.rs](../src/develop/auto.rs) | Auto: the Basic tone sliders, Vibrance and Saturation predicted from a reduced render of the photo by fits to Lightroom's Auto values, and white balance from gray world. |
 
 ## Camera profiles
 
@@ -106,7 +109,7 @@ remain private to their domain. This is one Rust package, not a multi-crate work
 | [look_settings.rs](../src/camera_profiles/look_settings.rs) | Exposure, Saturation, colour mixer, parametric curve, split toning and vignette settings inside looks; `Recipe::with_profile_adjustments` renders them with the user's. |
 | [rgb_table.rs](../src/camera_profiles/rgb_table.rs) | Adobe RGB tables (1D and 3D, in their own primaries and encoding) of creative and camera-matching looks, with tetrahedral interpolation; the colour stage applies them after the colour mixer (`develop.wgsl`'s `rgb_table` on the GPU). |
 | [temperature.rs](../src/camera_profiles/temperature.rs) | DNG temperature/tint and chromaticity conversion. |
-| [reference.rs](../src/camera_profiles/reference.rs) | Verified camera-specific exposure baseline and neutral calibration data. |
+| [reference.rs](../src/camera_profiles/reference.rs) | A photo's baseline exposure (DNG tag or camera table) and verified neutral calibration data. |
 | [dng_tone.rs](../src/camera_profiles/dng_tone.rs) | Adobe DNG default tone-curve data. |
 | [open.rs](../src/camera_profiles/open.rs) | RAWmakase Standard and Color, our own profiles for every camera with a colour matrix. |
 
@@ -117,7 +120,8 @@ remain private to their domain. This is one Rust package, not a multi-crate work
 | [lens/mod.rs](../src/lens/mod.rs) | Radial correction model: vignetting gain, distortion and lateral CA scales, fill scale. |
 | [lens/auto_ca.rs](../src/lens/auto_ca.rs) | Remove Chromatic Aberration: lateral CA measured from the decoded image as red and blue radial scales. |
 | [lens/embedded.rs](../src/lens/embedded.rs) | Bounded reader for Fujifilm and Sony built-in correction tables in the RAW container. See [lens corrections](lens-corrections.md). |
-| [lens/lcp.rs](../src/lens/lcp.rs) | Adobe lens profiles (LCP), imported explicitly into `lens-profiles` and matched to the photo's lens. |
+| [lens/lcp.rs](../src/lens/lcp.rs) | Adobe lens profiles (LCP), imported explicitly into `lens-profiles`, cached, listed for the photo's camera and matched to its lens. |
+| [lens/choice.rs](../src/lens/choice.rs) | Lightroom's lens profile Setup (Default, Auto, Custom), the profile an edit names, which one renders, and the Make/Model/Profile menus. |
 
 ## XMP and presets
 
@@ -134,6 +138,8 @@ recipes and the installed preset collection; they do not own the renderer.
 | [local.rs](../src/xmp/local.rs) | Lightroom's spot removal, red eye and masks (`RetouchAreas`, legacy `RetouchInfo`, `RedEyeInfo`, mask correction lists) from XMP or a catalog, as retouch operations, red eye corrections and masks; import only. |
 | [presets/mod.rs](../src/presets/mod.rs) | Public preset API. |
 | [native.rs](../src/presets/native.rs) | Native JSON recipe preset load/save and shared migration handling. |
+| [amount.rs](../src/presets/amount.rs) | Lightroom's preset Amount: which presets offer one, and the settings at an Amount from those before the preset and the preset's result. |
+| [curves.rs](../src/presets/curves.rs) | The Point Curve menu's curves: Lightroom's built-in point curves, the curves saved in the data directory's `curves/` folder, and the name the menu shows. |
 | [builtin.rs](../src/presets/builtin.rs) | Built-in presets embedded from `assets/presets`, their group order and ids. |
 | [library.rs](../src/presets/library.rs) | XMP collection discovery, import without overwriting existing files, display names and favorites. |
 
@@ -211,20 +217,28 @@ above rather than implementing SQL, file formats or pixel processing.
 | [onboarding.rs](../src/app/onboarding.rs) | First-run setup: a catalog, then optional Lightroom profiles and presets. |
 | [theme.rs](../src/app/theme.rs), [icons.rs](../src/app/icons.rs) | Interface colors (Lightroom's neutral grays, with fastframe-theme's palettes) and the Lucide icon set. |
 | [inspector.rs](../src/app/inspector.rs) | Histogram, adjustment controls and export settings. |
+| [inspector/lens_profile.rs](../src/app/inspector/lens_profile.rs) | Lens Corrections' Setup, Make, Model and Profile menus over the imported lens profiles. |
+| [color_grading.rs](../src/app/color_grading.rs) | The Color Grading panel: 3-Way and single-wheel views, hue/saturation wheels (Shift constrains, Cmd fine, double-click resets), Luminance, Blending and Balance, over the recipe's grading values. |
+| [targeted_tool.rs](../src/app/targeted_tool.rs) | The Targeted Adjustment Tool over the photo: its drag, the sample off the UI thread, the panels' target buttons and shortcuts. |
+| [point_color_panel.rs](../src/app/point_color_panel.rs) | The Color Mixer's Point Color tab: the dropper, swatches, shifts, Variance, Range, the range handles and Visualize Range. |
 | [tone_drag.rs](../src/app/tone_drag.rs) | Dragging in the histogram: its five regions, the slider each drives, and one History step per drag. |
 | [clipping.rs](../src/app/clipping.rs) | The histogram's clipping triangles: independent shadow and highlight warnings, hover preview, J, and the triangles' channel colours. |
 | [viewport.rs](../src/app/viewport.rs) | Photo canvas, fit/100%, pan, crop (with its guide overlay and Straighten ruler) and white-balance picking; hands the pointer to the active tool. |
+| [before_after.rs](../src/app/before_after.rs) | Before/After views (Before alone, side by side, split), their panes and shared zoom, the open photo's Before settings (set from History or a snapshot, copied or swapped with the edit), and the render of the side beside the edit (Before, or the reference photo). |
+| [readout.rs](../src/app/readout.rs) | The RGB readout under the histogram: the rendered pixel under the pointer in Melissa RGB, and asking renders to keep their pixels only while the pointer is over the photo. |
+| [reference.rs](../src/app/reference.rs) | Reference View: the reference photo (set from the filmstrip's menu or by dragging it onto the Reference side), its lock, layout and own Fit/100% zoom, developing it with its saved edit, and keeping it while moving between photos. |
 | [crop_tool.rs](../src/app/crop_tool.rs) | The Crop tool's guide overlays (O, Shift+O), Straighten ruler, portrait/landscape swap (X) and Auto straighten. See [transform](transform.md#crop-and-straighten). |
 | [guided_tool.rs](../src/app/guided_tool.rs) | The Guided Upright tool (Shift+T): drawing, moving, selecting and deleting guides, its loupe and grid. See [transform](transform.md#guided-upright). |
 | [overlay.rs](../src/app/overlay.rs) | The active tool's drawing over the photo (pins, circles, brush cursor, handles) and pointer ownership. |
 | [retouch_tool.rs](../src/app/retouch_tool.rs) | Remove tool (Q): spots, brushed areas, source dragging, keys and its drawer. |
 | [red_eye_tool.rs](../src/app/red_eye_tool.rs) | Red Eye tool: Red Eye and Pet Eye, finding a pupil from a dragged circle or a click, moving, Delete, Pupil Size, Darken and the pet eye's catchlight. |
 | [mask_tool.rs](../src/app/mask_tool.rs) | Masking tool (Shift+W): mask list, components, brushes and gradients on the photo, and the local adjustment sliders. |
-| [presets.rs](../src/app/presets.rs) | Preset search, groups, favorites, compatibility, application and temporary hover previews. |
+| [presets.rs](../src/app/presets.rs) | Preset search, groups, favorites, compatibility, application, the Amount slider and temporary hover previews. |
 | [snapshots.rs](../src/app/snapshots.rs) | Develop's Snapshots panel: named states of the open photo's edit, kept per photo in the catalog (`catalog/snapshots.rs`, including Lightroom's imported snapshots). |
+| [curve_menu.rs](../src/app/curve_menu.rs) | The Tone Curve panel's Point Curve menu: choosing a curve as one History step, and the Save Point Curve window. |
 | [user_presets.rs](../src/app/user_presets.rs) | New Develop Preset, and Update, Rename and Delete for presets made here (`presets/user.rs`, written by `xmp/preset_write.rs`). |
 | [photo_metadata.rs](../src/app/photo_metadata.rs) | Rating, color label and pick/reject controls and shortcuts. |
-| [widgets.rs](../src/app/widgets.rs) | Shared buttons, adjustment sections, sliders, curve editor and workspace tabs. |
+| [widgets.rs](../src/app/widgets.rs) | Shared buttons, adjustment sections (with Lightroom's panel switches and per-side Solo Mode), sliders (Up/Down over a hovered slider), curve editor and workspace tabs. |
 | [library/mod.rs](../src/app/library/mod.rs) | The Library: composes the owners below, writes metadata and virtual-copy changes to the catalog, and draws the sidebar, grid, filmstrip and info panel. |
 | [library/filter.rs](../src/app/library/filter.rs) | The source (folder scope or collection), the filter bar's search, flag, rating and label, the offline filter and sort order; computes what is shown. |
 | [library/availability.rs](../src/app/library/availability.rs) | Which originals are online, found out in the background while the Library already shows them. |
@@ -241,9 +255,10 @@ above rather than implementing SQL, file formats or pixel processing.
 | File | Responsibility |
 | --- | --- |
 | [worker/mod.rs](../src/app/worker/mod.rs) | Named event payloads, load/render jobs, task kinds, render stages and repaint notification. |
-| [worker/latest.rs](../src/app/worker/latest.rs) | Single-slot mailbox: submitting a new job replaces pending work rather than growing a queue. A panicking job does not end the thread. |
+| [worker/latest.rs](../src/app/worker/latest.rs) | Single-slot mailbox: submitting a new job replaces pending work rather than growing a queue; optional lanes each keep their own latest job. A panicking job does not end the thread. |
 | [worker/loader.rs](../src/app/worker/loader.rs) | RAW metadata and profile loading, embedded preview, the half-size then full decoded image and neighboring thumbnails. |
-| [worker/renderer.rs](../src/app/worker/renderer.rs) | Fit previews, reduced-then-full 100% regions, cancellation, monitor conversion and clipping overlays. After a panic it reports the job failed and rebuilds all of its state. |
+| [worker/reference.rs](../src/app/worker/reference.rs) | Develops Reference View's photo with its catalog edit on its own thread: half size first for Fit, then in full (through the decode cache) for 100%. |
+| [worker/renderer.rs](../src/app/worker/renderer.rs) | Fit previews, reduced-then-full 100% regions, cancellation, monitor conversion and clipping overlays, for the edit and, in its own lane with its own caches and textures, Before beside it. After a panic it reports the job failed and rebuilds all of its state. |
 
 ## How an operation moves through the app
 
@@ -293,6 +308,7 @@ above rather than implementing SQL, file formats or pixel processing.
 | Native preset / exported photo | User-selected JSON / JPEG / TIFF destination. |
 | Session preferences | `session.json` in the data directory; last path and monitor ICC path. UI tests inject a temporary destination or disable writes. |
 | Preset favorites | `preset-favorites.json` in the data directory. |
+| Saved point curves | `curves/` in the data directory: one XMP file per curve, named by the curve. |
 | Installed assets | `xmp-presets/` and `camera-profiles/` under asset roots; shared discovery also checks the legacy XDG/Linux data location. Imported XMP files go to `xmp-presets/Imported/` under the current data directory. |
 | Library previews | `previews.sqlite3` in the data directory; disposable cache, not a source of edits. |
 | Decoded photos | `decoded/` in the cache directory (`~/Library/Caches/RAWmakase` on macOS, `$XDG_CACHE_HOME/rawmakase`, default `~/.cache/rawmakase`, on Linux; `RAWMAKASE_CACHE_DIR` overrides it): developed camera images of opened and prefetched photos, capped at 4 GB, least recently used removed first. Disposable. |

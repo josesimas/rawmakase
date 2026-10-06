@@ -1,5 +1,6 @@
 //! Full-resolution detail processing shared by Fit, 100% regions and exports.
 use crate::develop::masks::{MaskWeights, local::slot};
+use crate::develop::sharpening::Sharpener;
 use crate::develop::{
     pipeline::Toned,
     preview_renderer::Stages,
@@ -89,7 +90,7 @@ fn sharpen_cancellable(
     local: Option<&MaskWeights>,
     cancel: &AtomicBool,
 ) -> Result<()> {
-    sharpen_with_radius(im, r, r.sharpening_radius, local, cancel)
+    sharpen_with_radius(im, r, Sharpener::new(r).sigma, local, cancel)
 }
 /// Normalized Gaussian taps. Below half a pixel, which only scaled previews use, a
 /// sampled Gaussian degenerates to a single tap; three taps with the same variance
@@ -119,6 +120,7 @@ fn sharpen_with_radius(
     if r.sharpening == 0. && local.is_none() {
         return Ok(());
     }
+    let sharpener = Sharpener::new(r);
     let (radius, weights) = gaussian(sigma);
     let lum: Vec<f32> = im.pixels.par_iter().map(|p| luminance(*p)).collect();
     let w = im.width as usize;
@@ -151,19 +153,7 @@ fn sharpen_with_radius(
             + local
                 .and_then(|w| w.delta(i))
                 .map_or(0., |d| d[slot::SHARPNESS]);
-        // Edge mask suppresses sharpening of smooth areas; Detail admits finer texture.
-        let threshold = r.sharpening_masking * 0.03 * (1. - r.sharpening_detail * 0.8);
-        let mask = if threshold == 0. {
-            1.
-        } else {
-            (d.abs() / threshold).clamp(0., 1.)
-        };
-        let delta = if amount >= 0. {
-            (d * amount * 2. * mask).clamp(-0.08, 0.08)
-        } else {
-            // Negative local Sharpness blurs toward the Gaussian.
-            -d * (-amount).min(1.)
-        };
+        let delta = sharpener.delta(d, amount);
         // Add only luminance detail, preserving inter-channel differences.
         for v in p {
             *v = (*v + delta).clamp(0., 1.);
@@ -517,6 +507,108 @@ pub(crate) fn retouched(
         None => Ok(Arc::new(develop::retouch::apply(&recovered, ops))),
     }
 }
+/// Point Color's dropper at (`u`, `v`) of the shown photo: the color Point Color sees
+/// there, averaged over 5×5 output pixels, rendered as the photo is (lens corrections,
+/// retouching, masks and the swatches already there included), as a swatch's
+/// `source`: HSV of linear ProPhoto RGB with the hue in sixths of a turn.
+pub fn point_color_pick(
+    im: &CameraImage,
+    r: &Recipe,
+    u: f32,
+    v: f32,
+    cancel: &AtomicBool,
+) -> Result<[f32; 3]> {
+    let [mean] = stage_means(
+        im,
+        r,
+        u,
+        v,
+        [develop::pipeline::PixelOutput::PointColor],
+        cancel,
+    )?;
+    let [h, s, v] = develop::point_color::rgb_to_hsv(mean);
+    Ok([
+        (h / std::f32::consts::TAU * 6.).rem_euclid(6.),
+        s.clamp(0., 1.),
+        v.clamp(0., 1.),
+    ])
+}
+/// The Targeted Adjustment Tool at (`u`, `v`) of the shown photo: what the tone
+/// curve, the color mixer and the black & white mix see there, averaged over 5×5
+/// output pixels and rendered as the photo is.
+pub fn targeted_sample(
+    im: &CameraImage,
+    r: &Recipe,
+    u: f32,
+    v: f32,
+    cancel: &AtomicBool,
+) -> Result<develop::targeted::TargetSample> {
+    use develop::pipeline::PixelOutput;
+    let [tone, mixer, color] = stage_means(
+        im,
+        r,
+        u,
+        v,
+        [
+            PixelOutput::CurveInput,
+            PixelOutput::MixerInput,
+            PixelOutput::ColorInput,
+        ],
+        cancel,
+    )?;
+    Ok(develop::targeted::TargetSample {
+        tone: tone[0],
+        mixer,
+        color,
+    })
+}
+/// The mean of 5×5 output pixels around (`u`, `v`) at each of `outputs`' stages.
+fn stage_means<const N: usize>(
+    im: &CameraImage,
+    r: &Recipe,
+    u: f32,
+    v: f32,
+    outputs: [develop::pipeline::PixelOutput; N],
+    cancel: &AtomicBool,
+) -> Result<[[f32; 3]; N]> {
+    let shown = r.as_rendered();
+    shown.validate()?;
+    let effective = shown.resolved(&im.metadata);
+    let r = effective.as_ref();
+    if r.lens_ca {
+        crate::lens::auto_ca::prime(im);
+    }
+    // Through a fresh retouch cache, which checks `cancel` between operations.
+    let mut retouch = develop::retouch::RetouchCache::default();
+    let source = retouched(im, r, cancel, Some(&mut retouch))?;
+    let g = Geometry::new(&source, r, 0);
+    let (toned, tonal) = local_stage(&source, r, 1., cancel, None)?;
+    let at = |t: f32, size: u32| {
+        let c = (t.clamp(0., 1.) * size as f32) as u32;
+        c.saturating_sub(2).min(size.saturating_sub(5))
+    };
+    let region = [
+        at(u, g.width),
+        at(v, g.height),
+        g.width.min(5),
+        g.height.min(5),
+    ];
+    let mut means = [[0.; 3]; N];
+    for (mean, output) in means.iter_mut().zip(outputs) {
+        use develop::pipeline::PixelOutput;
+        let out = develop::pipeline::stage_samples(&toned, &tonal, &g, region, output, cancel)?;
+        let n = out.pixels.len() as f32;
+        // ProPhoto RGB without negative channels, as Point Color and the mixer see it.
+        let floor = if matches!(output, PixelOutput::PointColor | PixelOutput::MixerInput) {
+            0.
+        } else {
+            f32::NEG_INFINITY
+        };
+        *mean =
+            std::array::from_fn(|c| out.pixels.iter().map(|p| p[c].max(floor)).sum::<f32>() / n);
+    }
+    Ok(means)
+}
 /// Clarity, Texture and, before engine 4, Shadows and Highlights, as a gain of the
 /// camera image, plus the recipe for the per-pixel stage that follows.
 fn local_stage(
@@ -534,6 +626,10 @@ fn local_stage(
         spatial.shadows = 0.;
         spatial.highlights = 0.;
     }
+    // The measured positive Clarity is part of the map (clarity.rs).
+    if develop::clarity::measured(r) != 0. {
+        spatial.effects.clarity = 0.;
+    }
     let mut tonal = r.clone();
     if !measured {
         tonal.shadows = 0.;
@@ -549,8 +645,8 @@ fn local_stage(
     let mut cache = cache;
     if spatial.shadows != 0.
         || spatial.highlights != 0.
-        || r.effects.clarity != 0.
-        || r.effects.texture != 0.
+        || spatial.effects.clarity != 0.
+        || spatial.effects.texture != 0.
     {
         let (gain, key) = local_gain(im, &spatial, scale, cancel, cache.as_deref_mut())?;
         (toned.gain, toned.gain_key) = (Some(gain), key);
@@ -558,7 +654,7 @@ fn local_stage(
     // The engine 4 Shadows/Highlights map starts from a reduced copy of the toned image,
     // for the global sliders or a mask's.
     if let Some(cache) = cache
-        && develop::pipeline::pixel_params::needs_map(r)
+        && develop::pipeline::pixel_params::needs_reduced(r)
     {
         let key = ReducedKey::new(&toned);
         let bytes = |im: &CameraImage| im.pixels.len() * 12;
@@ -653,6 +749,9 @@ fn render_resident(
     let mut spatial = base.clone();
     spatial.shadows = 0.;
     spatial.highlights = 0.;
+    if develop::clarity::measured(&base) != 0. {
+        spatial.effects.clarity = 0.;
+    }
     let mut toned = Toned {
         image: source.clone(),
         scale,
@@ -661,8 +760,8 @@ fn render_resident(
         reduced: None,
     };
     let mut tones = None;
-    if r.effects.clarity != 0. || r.effects.texture != 0. {
-        let texture = r.effects.texture != 0.;
+    if spatial.effects.clarity != 0. || spatial.effects.texture != 0. {
+        let texture = spatial.effects.texture != 0.;
         let blur_key = BlurKey::new(source, &spatial, scale, texture);
         let Some(camera) = pixel_params(Source::from(source.as_ref()), &spatial) else {
             return Ok(None);
@@ -701,7 +800,7 @@ fn render_resident(
             return Ok(None);
         }
     }
-    if develop::pipeline::pixel_params::needs_map(&base) {
+    if develop::pipeline::pixel_params::needs_reduced(&base) {
         let edge = develop::local_tone::MAP_EDGE;
         let size = if source.width.max(source.height) <= edge {
             (source.width, source.height)
@@ -835,7 +934,7 @@ pub(crate) fn render_level(
     (g.width, g.height) = size;
     // Output pixels per full-resolution pixel.
     let scale = level_scale / footprint;
-    let sigma = r.sharpening_radius * scale;
+    let sigma = Sharpener::new(r).sigma * scale;
     let [x, y, w, h] = region;
     ensure!(
         w > 0
@@ -983,7 +1082,7 @@ pub(crate) fn render_preview(
         "Invalid viewport region"
     );
     let halo = if r.sharpening > 0. {
-        (3. * r.sharpening_radius).ceil() as u32
+        (3. * Sharpener::new(r).sigma).ceil() as u32
     } else {
         0
     };
@@ -1003,7 +1102,7 @@ pub(crate) fn render_preview(
         region.is_some() || output_size(g.width, g.height, max_edge) == (g.width, g.height);
     if unresized && let Some(stages) = stages.as_mut() {
         let finish = develop::gpu::Finish {
-            sigma: r.sharpening_radius,
+            sigma: Sharpener::new(r).sigma,
             origin: [left, top],
             full: [g.width, g.height],
             scale: 1.,
@@ -1023,7 +1122,7 @@ pub(crate) fn render_preview(
     )?;
     if unresized && let Some(stages) = stages.as_mut() {
         let finish = develop::gpu::Finish {
-            sigma: r.sharpening_radius,
+            sigma: Sharpener::new(r).sigma,
             origin: [left, top],
             full: [g.width, g.height],
             scale: 1.,
@@ -1058,7 +1157,7 @@ pub(crate) fn render_preview(
         .is_some_and(|w| w.uses(&[slot::SHARPNESS, slot::NOISE]));
     let spatial = r.effects.grain != 0.
         || r.effects.vignette != 0.
-        || r.effects.lens_vignette != 0.
+        || r.finished_lens_vignette() != 0.
         || local_finish;
     let mut gpu_sharpened = false;
     let edge = if region.is_some() { 0 } else { max_edge };

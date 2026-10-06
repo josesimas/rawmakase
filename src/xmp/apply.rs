@@ -39,6 +39,13 @@ struct Settings<'a> {
     seen: BTreeSet<String>,
 }
 impl Settings<'_> {
+    /// Whether a packet RAWmakase wrote names `operator` as kept from before it was
+    /// measured, so Lightroom's values for it don't switch it to the measured one.
+    fn keeps_original(&self, operator: &str) -> bool {
+        self.values
+            .get("RAWmakaseOriginal")
+            .is_some_and(|v| v.split(',').any(|name| name.trim() == operator))
+    }
     fn assign(&mut self, key: &str, out: &mut f32, scale: f32, lo: f32, hi: f32) -> Result<()> {
         self.seen.insert(key.to_string());
         if let Some(value) = number(self.values, key)? {
@@ -87,6 +94,8 @@ const METADATA: &[&str] = &[
     "RawFileName",
     // Marks a preset made in RAWmakase, which it may update, rename or delete.
     "RAWmakasePreset",
+    // Operators a RAWmakase recipe keeps from before they were measured.
+    "RAWmakaseOriginal",
 ];
 impl Preset {
     /// Apply to a private recipe, publishing only after every stage validates.
@@ -413,6 +422,22 @@ impl Preset {
             0.,
             1.,
         )?;
+        // Lightroom's values mean the measured operator, also on a recipe saved before.
+        if [
+            "Sharpness",
+            "SharpenRadius",
+            "SharpenDetail",
+            "SharpenEdgeMasking",
+        ]
+        .iter()
+        .any(|k| settings.values.contains_key(*k))
+        {
+            r.sharpening_model = crate::develop::sharpening::SharpeningModel::Measured;
+        }
+        // RAWmakase's own packet for a recipe that kept the original operator.
+        if settings.keeps_original(super::write::ORIGINAL_SHARPENING) {
+            r.sharpening_model = crate::develop::sharpening::SharpeningModel::Original;
+        }
         settings.assign("LuminanceSmoothing", &mut r.noise_luma, 0.01, 0., 1.)?;
         settings.assign("ColorNoiseReduction", &mut r.noise_chroma, 0.01, 0., 1.)?;
         Ok(())
@@ -533,6 +558,31 @@ impl Preset {
             )?;
         }
         settings.assign("ShadowTint", &mut r.effects.shadow_tint, 0.01, -1., 1.)?;
+        // Lightroom's values mean the measured operators, also on a recipe saved
+        // before; RAWmakase's own packet names the ones a recipe kept from before.
+        let mixer_keys = bands.iter().flat_map(|band| {
+            ["Hue", "Saturation", "Luminance"].map(|control| format!("{control}Adjustment{band}"))
+        });
+        if mixer_keys.into_iter().any(|key| v.contains_key(&key)) {
+            r.mixer_model = crate::develop::color_mixer::MixerModel::Chart;
+        }
+        if settings.keeps_original(super::write::ORIGINAL_COLOR_MIXER) {
+            r.mixer_model = crate::develop::color_mixer::MixerModel::Original;
+        }
+        let primaries = [
+            "RedHue",
+            "RedSaturation",
+            "GreenHue",
+            "GreenSaturation",
+            "BlueHue",
+            "BlueSaturation",
+        ];
+        if primaries.iter().any(|key| v.contains_key(*key)) {
+            r.calibration_model = crate::develop::calibration::CalibrationModel::Measured;
+        }
+        if settings.keeps_original(super::write::ORIGINAL_CALIBRATION) {
+            r.calibration_model = crate::develop::calibration::CalibrationModel::Original;
+        }
         if [
             "RedHue",
             "RedSaturation",
@@ -705,6 +755,13 @@ impl Preset {
     fn apply_effects(&self, settings: &mut Settings<'_>, r: &mut Recipe) -> Result<()> {
         let v = settings.values;
         settings.assign("Clarity2012", &mut r.effects.clarity, 0.01, -1., 1.)?;
+        // Lightroom's Clarity means the measured operator, also on a recipe saved before.
+        if settings.values.contains_key("Clarity2012") {
+            r.clarity_model = crate::develop::clarity::ClarityModel::Measured;
+        }
+        if settings.keeps_original(super::write::ORIGINAL_CLARITY) {
+            r.clarity_model = crate::develop::clarity::ClarityModel::Original;
+        }
         settings.assign("Texture", &mut r.effects.texture, 0.01, -1., 1.)?;
         settings.assign("Dehaze", &mut r.effects.dehaze, 0.01, -1., 1.)?;
         settings.assign("GrainAmount", &mut r.effects.grain, 0.01, 0., 1.)?;
@@ -716,6 +773,16 @@ impl Preset {
             0.,
             1.,
         )?;
+        // Lightroom's values mean the measured grain, also on a recipe saved before.
+        if ["GrainAmount", "GrainSize", "GrainFrequency"]
+            .iter()
+            .any(|k| settings.values.contains_key(*k))
+        {
+            r.grain_model = crate::develop::effects::GrainModel::Measured;
+        }
+        if settings.keeps_original(super::write::ORIGINAL_GRAIN) {
+            r.grain_model = crate::develop::effects::GrainModel::Original;
+        }
         settings.seen.insert("GrainSeed".into());
         if let Some(seed) = v.get("GrainSeed") {
             r.effects.grain_seed = seed.parse().context("Invalid grain seed")?;
@@ -777,6 +844,16 @@ impl Preset {
             0.,
             1.,
         )?;
+        // Lightroom's values mean the measured operator, also on a recipe saved before.
+        if ["VignetteAmount", "VignetteMidpoint"]
+            .iter()
+            .any(|k| settings.values.contains_key(*k))
+        {
+            r.lens_vignette_model = crate::develop::effects::LensVignetteModel::Measured;
+        }
+        if settings.keeps_original(super::write::ORIGINAL_LENS_VIGNETTE) {
+            r.lens_vignette_model = crate::develop::effects::LensVignetteModel::Original;
+        }
         for (i, name) in ["Purple", "Green"].iter().enumerate() {
             settings.assign(
                 &format!("Defringe{name}Amount"),
@@ -894,14 +971,36 @@ impl Preset {
         let v = settings.values;
         settings.assign("CropAngle", &mut r.straighten, 1., -45., 45.)?;
         settings.seen.insert("LensProfileEnable".into());
-        // Which Adobe profile Lightroom chose; RAWmakase matches imported profiles itself.
+        // Which Adobe profile the edit uses. Whether Lightroom took it from the RAW
+        // instead does not change which profile is named.
         for key in [
+            "LensProfileSetup",
             "LensProfileName",
             "LensProfileFilename",
             "LensProfileDigest",
             "LensProfileIsEmbedded",
         ] {
             settings.seen.insert(key.into());
+        }
+        let embedded = boolean(v, "LensProfileIsEmbedded")?.unwrap_or(false);
+        let text = |key: &str| v.get(key).map(|s| s.trim().to_string()).unwrap_or_default();
+        let (name, filename) = (text("LensProfileName"), text("LensProfileFilename"));
+        let id = (!name.is_empty() || !filename.is_empty()).then(|| {
+            crate::lens::choice::LensProfileId {
+                name,
+                filename,
+                digest: text("LensProfileDigest"),
+                embedded,
+            }
+        });
+        if let Some(setup) = v.get("LensProfileSetup") {
+            // A Setup names its profile, or none (a preset's "Default").
+            r.lens_profile_choice = crate::lens::choice::LensProfileChoice {
+                setup: crate::lens::choice::LensProfileSetup::from_xmp(setup.trim()),
+                id,
+            };
+        } else if id.is_some() {
+            r.lens_profile_choice.id = id;
         }
         settings.assign(
             "LensProfileDistortionScale",
@@ -1061,6 +1160,8 @@ impl Preset {
         }
         let edits = super::local::convert(&self.local, crate::develop::ImageFrame::for_metadata(m));
         if let Some(retouch) = edits.retouch {
+            // Lightroom's spots mean Camera Raw's feather, also on a recipe saved before.
+            r.retouch_model = crate::develop::retouch::RetouchModel::Measured;
             r.retouch = retouch;
         }
         if let Some(red_eye) = edits.red_eye {
@@ -1090,10 +1191,31 @@ impl Preset {
                 );
             }
         }
-        settings.seen.insert("LensProfileSetup".into());
         // Lightroom 15 records whether the crop is kept inside the image; it only
         // constrains the crop tool and does not change rendering.
         settings.seen.insert("CropConstrainToUnitSquare".into());
+        // Lightroom 15 writes these into every record. Glow's own controls do nothing
+        // while Glow is 0 (an active Glow is refused above), the SDR and HDR values
+        // apply only in HDR editing, and Distraction Removal's switch changes nothing
+        // without removals, which are reported on their own.
+        let at_rest = |key: &str| v.get(key).is_none_or(|value| value.parse() == Ok(0f32));
+        let mut neutral = vec!["EnableDistractionRemoval"];
+        if at_rest("Glow") {
+            neutral.extend(["GlowRange", "GlowSpread", "GlowStyle", "GlowWarmth"]);
+        }
+        if at_rest("HDREditMode") {
+            neutral.extend([
+                "HDRMaxValue",
+                "SDRBlend",
+                "SDRBrightness",
+                "SDRClarity",
+                "SDRContrast",
+                "SDRHighlights",
+                "SDRShadows",
+                "SDRWhites",
+            ]);
+        }
+        settings.seen.extend(neutral.into_iter().map(String::from));
         let unknown: Vec<_> = v
             .keys()
             .filter(|k| !settings.seen.contains(*k))

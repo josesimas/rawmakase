@@ -104,6 +104,43 @@ pub(super) fn look_element(r: &Recipe) -> Option<String> {
     ))
 }
 
+/// Lightroom's lens profile Setup and the profile the edit uses: the one rendering
+/// when the photo is known, else the one the edit names.
+fn lens_profile(s: &mut Settings, r: &Recipe, m: Option<&Metadata>) {
+    let choice = &r.lens_profile_choice;
+    s.text("LensProfileSetup", choice.setup.xmp());
+    let resolved = m.map(|m| r.lens_profile_in_use(m));
+    let in_use = resolved.as_ref().and_then(|r| r.used);
+    let missing = resolved.as_ref().is_some_and(|r| r.missing.is_some());
+    let id = match (in_use, &choice.id) {
+        // A profile the edit names that isn't imported stays named, so the edit
+        // finds it again once it is; the digest the edit recorded still describes
+        // the same file.
+        (Some(c), Some(id))
+            if missing
+                || (c.profile.is(&id.filename, &id.name)
+                    && (id.name.is_empty() || id.name == c.profile.name)) =>
+        {
+            id.clone()
+        }
+        (Some(c), _) => crate::lens::choice::LensProfileId::of(&c.profile),
+        (None, Some(id)) => id.clone(),
+        (None, None) => return,
+    };
+    if !id.name.is_empty() {
+        s.text("LensProfileName", id.name);
+    }
+    if !id.filename.is_empty() {
+        s.text("LensProfileFilename", id.filename);
+    }
+    if !id.digest.is_empty() {
+        s.text("LensProfileDigest", id.digest);
+    }
+    if id.embedded {
+        s.text("LensProfileIsEmbedded", "True");
+    }
+}
+
 pub(super) fn settings(r: &Recipe, m: Option<&Metadata>) -> Settings {
     let mut s = Settings(Vec::new());
     s.text("ProcessVersion", "11.0");
@@ -358,6 +395,7 @@ pub(super) fn settings(r: &Recipe, m: Option<&Metadata>) -> Settings {
         );
     }
     s.text("LensProfileEnable", if r.lens_profile { "1" } else { "0" });
+    lens_profile(&mut s, r, m);
     s.text("AutoLateralCA", if r.lens_ca { "1" } else { "0" });
     s.put(
         "LensProfileDistortionScale",
@@ -556,6 +594,51 @@ pub fn keyword_lists(keywords: &[KeywordPath]) -> (Vec<String>, Vec<String>) {
     (subject, hierarchical)
 }
 
+/// The operators this recipe keeps from before they were measured in Camera Raw,
+/// each with a Lightroom setting it renders. Lightroom's values for them would read
+/// back as the measured ones, so RAWmakase names them for itself to render the recipe
+/// as it was.
+pub(super) fn original_operators(r: &Recipe) -> Vec<(&'static str, &'static str)> {
+    [
+        (
+            r.sharpening_model.is_original(),
+            ORIGINAL_SHARPENING,
+            "Sharpness",
+        ),
+        (
+            r.lens_vignette_model.is_original(),
+            ORIGINAL_LENS_VIGNETTE,
+            "VignetteAmount",
+        ),
+        (r.grain_model.is_original(), ORIGINAL_GRAIN, "GrainAmount"),
+        (
+            r.clarity_model.is_original(),
+            ORIGINAL_CLARITY,
+            "Clarity2012",
+        ),
+        // These travel with Process Version, as copying settings does.
+        (
+            r.mixer_model.is_original(),
+            ORIGINAL_COLOR_MIXER,
+            "ProcessVersion",
+        ),
+        (
+            r.calibration_model.is_original(),
+            ORIGINAL_CALIBRATION,
+            "ProcessVersion",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(original, name, key)| original.then_some((name, key)))
+    .collect()
+}
+pub(super) const ORIGINAL_SHARPENING: &str = "Sharpening";
+pub(super) const ORIGINAL_LENS_VIGNETTE: &str = "LensVignette";
+pub(super) const ORIGINAL_GRAIN: &str = "Grain";
+pub(super) const ORIGINAL_CLARITY: &str = "Clarity";
+pub(super) const ORIGINAL_COLOR_MIXER: &str = "ColorMixer";
+pub(super) const ORIGINAL_CALIBRATION: &str = "Calibration";
+
 /// The XMP packet for an exported photo.
 pub fn packet(r: &Recipe, m: &Metadata, photo: &Photo) -> String {
     let mut attributes: Vec<(String, String)> = vec![
@@ -594,6 +677,13 @@ pub fn packet(r: &Recipe, m: &Metadata, photo: &Photo) -> String {
                 .into_iter()
                 .map(|(k, v)| (format!("crs:{k}"), v)),
         );
+        let original: Vec<_> = original_operators(r)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        if !original.is_empty() {
+            attributes.push(("crs:RAWmakaseOriginal".into(), original.join(",")));
+        }
         attributes.push(("crs:AlreadyApplied".into(), "True".into()));
     }
     let mut out = format!(

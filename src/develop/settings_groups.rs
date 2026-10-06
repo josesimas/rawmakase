@@ -225,7 +225,10 @@ impl SettingGroup {
             Whites => to.whites = from.whites,
             Blacks => to.blacks = from.blacks,
             Texture => e.texture = f.texture,
-            Clarity => e.clarity = f.clarity,
+            Clarity => {
+                e.clarity = f.clarity;
+                to.clarity_model = from.clarity_model;
+            }
             Dehaze => e.dehaze = f.dehaze,
             Vibrance => to.vibrance = from.vibrance,
             Saturation => to.saturation = from.saturation,
@@ -262,6 +265,7 @@ impl SettingGroup {
                 to.sharpening_radius = from.sharpening_radius;
                 to.sharpening_detail = from.sharpening_detail;
                 to.sharpening_masking = from.sharpening_masking;
+                to.sharpening_model = from.sharpening_model;
             }
             LuminanceNoiseReduction => {
                 to.noise_luma = from.noise_luma;
@@ -276,6 +280,7 @@ impl SettingGroup {
             LensProfileCorrections => {
                 to.lens_builtin = from.lens_builtin;
                 to.lens_profile = from.lens_profile;
+                to.lens_profile_choice = from.lens_profile_choice.clone();
                 to.lens_distortion = from.lens_distortion;
                 to.lens_vignetting = from.lens_vignetting;
                 to.lens_manual_distortion = from.lens_manual_distortion;
@@ -286,6 +291,7 @@ impl SettingGroup {
                 e.defringe_ranges = f.defringe_ranges;
             }
             LensVignetting => {
+                to.lens_vignette_model = from.lens_vignette_model;
                 e.lens_vignette = f.lens_vignette;
                 e.lens_vignette_midpoint = f.lens_vignette_midpoint;
             }
@@ -307,6 +313,7 @@ impl SettingGroup {
                 e.grain_size = f.grain_size;
                 e.grain_roughness = f.grain_roughness;
                 e.grain_seed = f.grain_seed;
+                to.grain_model = from.grain_model;
             }
             ProcessVersion => {
                 to.engine = from.engine;
@@ -315,12 +322,22 @@ impl SettingGroup {
                 to.reference_curves = from.reference_curves;
                 to.reference_calibration = from.reference_calibration;
                 to.reference_color = from.reference_color;
+                to.parametric_model = from.parametric_model;
+                to.contrast_model = from.contrast_model;
+                to.grading_model = from.grading_model;
+                to.mixer_model = from.mixer_model;
+                to.calibration_model = from.calibration_model;
+                to.whites_model = from.whites_model;
+                to.gamut_model = from.gamut_model;
             }
             Calibration => {
                 e.calibration = f.calibration;
                 e.shadow_tint = f.shadow_tint;
             }
-            SpotRemoval => to.retouch = from.retouch.clone(),
+            SpotRemoval => {
+                to.retouch = from.retouch.clone();
+                to.retouch_model = from.retouch_model;
+            }
             Crop => {
                 to.crop = from.crop;
                 to.straighten = from.straighten;
@@ -463,6 +480,18 @@ pub fn transfer(
             }
         }
     }
+    // A Custom lens profile this camera can't use (not imported, or made for a smaller
+    // sensor) is kept as the edit names it, and said, as on import.
+    let embedded = recipe
+        .lens_profile_choice
+        .id
+        .as_ref()
+        .is_some_and(|id| id.embedded);
+    if selection.contains(SettingGroup::LensProfileCorrections)
+        && (embedded || recipe.lens_profile_in_use(m).missing.is_some())
+    {
+        notes.extend(recipe.missing_lens_profile(m));
+    }
     // The baseline depends on both the profile and the process version.
     if selection.contains(SettingGroup::TreatmentAndProfile)
         || selection.contains(SettingGroup::ProcessVersion)
@@ -519,6 +548,7 @@ pub(crate) fn every_setting(r: &Recipe) -> Vec<(&'static str, Kind)> {
         engine: _,
         lens_builtin: _,
         lens_profile: _,
+        lens_profile_choice: _,
         lens_distortion: _,
         lens_vignetting: _,
         lens_manual_distortion: _,
@@ -532,12 +562,24 @@ pub(crate) fn every_setting(r: &Recipe) -> Vec<(&'static str, Kind)> {
         sharpening_radius: _,
         sharpening_detail: _,
         sharpening_masking: _,
+        sharpening_model: _,
         exposure: _,
         camera_exposure: _,
         wide_gamut_curves: _,
         reference_curves: _,
         reference_calibration: _,
         reference_color: _,
+        parametric_model: _,
+        grain_model: _,
+        clarity_model: _,
+        contrast_model: _,
+        lens_vignette_model: _,
+        retouch_model: _,
+        grading_model: _,
+        mixer_model: _,
+        calibration_model: _,
+        whites_model: _,
+        gamut_model: _,
         temperature: _,
         tint: _,
         wb: _,
@@ -611,6 +653,7 @@ pub(crate) fn every_setting(r: &Recipe) -> Vec<(&'static str, Kind)> {
         ("engine", Group(ProcessVersion)),
         ("lens_builtin", Group(LensProfileCorrections)),
         ("lens_profile", Group(LensProfileCorrections)),
+        ("lens_profile_choice", Group(LensProfileCorrections)),
         ("lens_distortion", Group(LensProfileCorrections)),
         ("lens_vignetting", Group(LensProfileCorrections)),
         ("lens_manual_distortion", Group(LensProfileCorrections)),
@@ -620,6 +663,7 @@ pub(crate) fn every_setting(r: &Recipe) -> Vec<(&'static str, Kind)> {
         ("preset_settings", PhotosOwn),
         ("profile", Group(TreatmentAndProfile)),
         ("profile_amount", Group(TreatmentAndProfile)),
+        ("sharpening_model", Group(Sharpening)),
         ("sharpening_radius", Group(Sharpening)),
         ("sharpening_detail", Group(Sharpening)),
         ("sharpening_masking", Group(Sharpening)),
@@ -629,6 +673,16 @@ pub(crate) fn every_setting(r: &Recipe) -> Vec<(&'static str, Kind)> {
         ("reference_curves", Group(ProcessVersion)),
         ("reference_calibration", Group(ProcessVersion)),
         ("reference_color", Group(ProcessVersion)),
+        ("parametric_model", Group(ProcessVersion)),
+        ("grain_model", Group(Grain)),
+        ("clarity_model", Group(Clarity)),
+        ("contrast_model", Group(ProcessVersion)),
+        ("lens_vignette_model", Group(LensVignetting)),
+        ("grading_model", Group(ProcessVersion)),
+        ("mixer_model", Group(ProcessVersion)),
+        ("calibration_model", Group(ProcessVersion)),
+        ("whites_model", Group(ProcessVersion)),
+        ("gamut_model", Group(ProcessVersion)),
         ("temperature", Group(WhiteBalance)),
         ("tint", Group(WhiteBalance)),
         ("wb", Derived),
@@ -661,6 +715,7 @@ pub(crate) fn every_setting(r: &Recipe) -> Vec<(&'static str, Kind)> {
         ("flip_x", PhotosOwn),
         ("flip_y", PhotosOwn),
         ("retouch", Group(SpotRemoval)),
+        ("retouch_model", Group(SpotRemoval)),
         // As in Lightroom, whose Copy Settings has no red eye group.
         ("red_eye", PhotosOwn),
         ("masks", Group(Masking)),

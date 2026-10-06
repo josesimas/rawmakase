@@ -540,6 +540,11 @@ fn lightroom_spots_and_masks_convert_to_image_space() -> Result<()> {
     assert_eq!(skipped.len(), 1, "{skipped:?}");
     assert!(skipped[0].contains("Select Subject"));
     assert_eq!(r.exposure, 0.2);
+    // Lightroom's spots render with Camera Raw's feather.
+    assert_eq!(
+        r.retouch_model,
+        crate::develop::retouch::RetouchModel::Measured
+    );
     let near = |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).abs() < 1e-5 && (a[1] - b[1]).abs() < 1e-5;
     let spot = &r.retouch[0];
     assert_eq!(
@@ -1153,4 +1158,205 @@ fn black_white_by_profile_writes_its_mix() {
         "{packet}"
     );
     assert!(packet.contains(r#"crs:GrayMixerBlue="-40""#), "{packet}");
+}
+/// Lightroom's lens profile Setup and the profile an edit names import, are kept when
+/// it isn't imported, and are written back as read.
+#[test]
+fn lens_profile_identity_round_trips() -> Result<()> {
+    use crate::lens::choice::{LensProfileChoice, LensProfileId, LensProfileSetup, tests};
+    let mut m = tests::photo();
+    m.wb = [1.; 3];
+    m.daylight_wb = [1.; 3];
+    m.matrix = [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]];
+    let apply = |attrs: &str, r: &Recipe| {
+        parse(Path::new("lens.xmp"), &xml(attrs, ""))?.apply(r, &m, &[], None)
+    };
+    let named = r#"c:LensProfileEnable="1" c:LensProfileSetup="Custom" c:LensProfileName="Adobe (Gone 24mm)" c:LensProfileFilename="Gone (24mm) - RAW.lcp" c:LensProfileDigest="0123456789ABCDEF0123456789ABCDEF" c:LensProfileIsEmbedded="False""#;
+    let r = apply(named, &Recipe::default())?;
+    let id = LensProfileId {
+        name: "Adobe (Gone 24mm)".into(),
+        filename: "Gone (24mm) - RAW.lcp".into(),
+        digest: "0123456789ABCDEF0123456789ABCDEF".into(),
+        embedded: false,
+    };
+    assert_eq!(
+        r.lens_profile_choice,
+        LensProfileChoice {
+            setup: LensProfileSetup::Custom,
+            id: Some(id.clone()),
+        }
+    );
+    assert!(r.lens_correction(&m).is_none());
+    assert!(
+        r.missing_lens_profile(&m)
+            .unwrap()
+            .contains("Adobe (Gone 24mm)")
+    );
+    let photo = crate::xmp::write::Photo {
+        raw_name: "IMG.RAW".into(),
+        settings: true,
+        format: "image/jpeg".into(),
+        ..Default::default()
+    };
+    let packet = crate::xmp::write::packet(&r, &m, &photo);
+    for key in [
+        r#"crs:LensProfileSetup="Custom""#,
+        r#"crs:LensProfileName="Adobe (Gone 24mm)""#,
+        r#"crs:LensProfileFilename="Gone (24mm) - RAW.lcp""#,
+        r#"crs:LensProfileDigest="0123456789ABCDEF0123456789ABCDEF""#,
+    ] {
+        assert!(packet.contains(key), "{key} {packet}");
+    }
+    let back = parse(Path::new("export.xmp"), &packet)?.apply(&Recipe::default(), &m, &[], None)?;
+    assert_eq!(back.lens_profile_choice, r.lens_profile_choice);
+    // Lightroom's names for the setups.
+    let auto = apply(r#"c:LensProfileSetup="Auto""#, &r)?;
+    assert_eq!(
+        auto.lens_profile_choice,
+        LensProfileChoice {
+            setup: LensProfileSetup::Auto,
+            id: None
+        }
+    );
+    let default = apply(r#"c:LensProfileSetup="LensDefaults""#, &r)?;
+    assert!(default.lens_profile_choice.is_default());
+    // A preset without lens settings leaves the choice alone.
+    assert_eq!(
+        apply(r#"c:Exposure2012="1""#, &r)?.lens_profile_choice,
+        r.lens_profile_choice
+    );
+    // Under Auto, the profile written is the one rendering.
+    let on = Recipe {
+        lens_profile: true,
+        ..Default::default()
+    };
+    let packet = crate::xmp::write::packet(&on, &m, &photo);
+    assert!(
+        packet.contains(r#"crs:LensProfileSetup="LensDefaults""#),
+        "{packet}"
+    );
+    assert!(
+        packet.contains(&format!(r#"crs:LensProfileFilename="{}""#, tests::ADOBE)),
+        "{packet}"
+    );
+    // The profile the RAW carries renders as the built-in correction, even with a
+    // matching profile imported, is not reported missing and is written back.
+    let embedded = apply(
+        r#"c:LensProfileEnable="1" c:LensProfileSetup="LensDefaults" c:LensProfileName="Camera Settings" c:LensProfileIsEmbedded="True""#,
+        &Recipe::default(),
+    )?;
+    assert!(embedded.lens_correction(&m).is_none());
+    // Without the RAW's own data, that is said; with it, nothing is missing.
+    assert!(
+        embedded
+            .missing_lens_profile(&m)
+            .unwrap()
+            .contains("Camera Settings")
+    );
+    let mut with_builtin = m.clone();
+    with_builtin.lens = Some(crate::lens::LensCorrection {
+        source: "Testcam built-in".into(),
+        vignetting: Some(crate::lens::Radial {
+            knots: vec![0., 1.],
+            values: vec![1., 1.5],
+        }),
+        ..Default::default()
+    });
+    let embedded_on = Recipe {
+        lens_builtin: true,
+        ..embedded.clone()
+    };
+    assert_eq!(embedded_on.missing_lens_profile(&with_builtin), None);
+    assert_eq!(
+        embedded_on
+            .lens_correction(&with_builtin)
+            .map(|l| l.source.as_str()),
+        Some("Testcam built-in")
+    );
+    let packet = crate::xmp::write::packet(&embedded, &m, &photo);
+    assert!(
+        packet.contains(r#"crs:LensProfileIsEmbedded="True""#),
+        "{packet}"
+    );
+    assert!(
+        packet.contains(r#"crs:LensProfileName="Camera Settings""#),
+        "{packet}"
+    );
+    // A file replaced under the same name by another profile is written as rendered,
+    // without the old digest.
+    let stale = apply(
+        &format!(
+            r#"c:LensProfileEnable="1" c:LensProfileSetup="Custom" c:LensProfileName="Adobe (Old)" c:LensProfileFilename="{}" c:LensProfileDigest="0123ABCD""#,
+            tests::ADOBE
+        ),
+        &Recipe::default(),
+    )?;
+    let packet = crate::xmp::write::packet(&stale, &m, &photo);
+    assert!(
+        packet.contains(r#"crs:LensProfileName="Adobe (Testcam 35mm F2)""#),
+        "{packet}"
+    );
+    assert!(!packet.contains("0123ABCD"), "{packet}");
+    // Lightroom's other boolean spelling.
+    let one = apply(
+        r#"c:LensProfileSetup="LensDefaults" c:LensProfileName="Camera Settings" c:LensProfileIsEmbedded="1""#,
+        &Recipe::default(),
+    )?;
+    assert!(one.lens_profile_choice.id.unwrap().embedded);
+    // Under Auto, a named profile that isn't imported stays named.
+    let gone = apply(
+        r#"c:LensProfileEnable="1" c:LensProfileSetup="Auto" c:LensProfileName="Adobe (Gone 24mm)" c:LensProfileFilename="Gone (24mm) - RAW.lcp""#,
+        &Recipe::default(),
+    )?;
+    let packet = crate::xmp::write::packet(&gone, &m, &photo);
+    assert!(
+        packet.contains(r#"crs:LensProfileFilename="Gone (24mm) - RAW.lcp""#),
+        "{packet}"
+    );
+    Ok(())
+}
+#[test]
+fn lightroom_mixer_and_calibration_take_the_measured_operators() -> Result<()> {
+    use crate::develop::{calibration::CalibrationModel, color_mixer::MixerModel};
+    // Recipe::default() stands for a recipe saved before the measured operators.
+    let apply = |attrs: &str| {
+        parse(Path::new("p.xmp"), &xml(attrs, ""))?.apply(
+            &Recipe::default(),
+            &Metadata::default(),
+            &[],
+            None,
+        )
+    };
+    let r = apply(r#"c:LuminanceAdjustmentBlue="-40" c:RedHue="20""#)?;
+    assert_eq!(r.mixer_model, MixerModel::Chart);
+    assert_eq!(r.calibration_model, CalibrationModel::Measured);
+    let r = apply(r#"c:Exposure2012="0.5""#)?;
+    assert_eq!(r.mixer_model, MixerModel::Original);
+    assert_eq!(r.calibration_model, CalibrationModel::Original);
+    // RAWmakase's own packet for a recipe that kept them.
+    let r = apply(
+        r#"c:LuminanceAdjustmentBlue="-40" c:RedHue="20" c:RAWmakaseOriginal="ColorMixer,Calibration""#,
+    )?;
+    assert_eq!(r.mixer_model, MixerModel::Original);
+    assert_eq!(r.calibration_model, CalibrationModel::Original);
+    Ok(())
+}
+#[test]
+fn lightroom_manual_vignetting_takes_the_measured_operator() -> Result<()> {
+    use crate::develop::effects::LensVignetteModel;
+    // Recipe::default() stands for a recipe saved before the measured operator.
+    let apply = |attrs: &str| {
+        parse(Path::new("p.xmp"), &xml(attrs, ""))?.apply(
+            &Recipe::default(),
+            &Metadata::default(),
+            &[],
+            None,
+        )
+    };
+    let r = apply(r#"c:VignetteAmount="-50" c:VignetteMidpoint="20""#)?;
+    assert_eq!(r.lens_vignette_model, LensVignetteModel::Measured);
+    assert_eq!(r.effects.lens_vignette, -0.5);
+    let r = apply(r#"c:Exposure2012="0.5""#)?;
+    assert_eq!(r.lens_vignette_model, LensVignetteModel::Original);
+    Ok(())
 }

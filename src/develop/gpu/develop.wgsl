@@ -391,9 +391,31 @@ fn measured(t: i32, values: i32, s_in: f32, x: f32) -> f32 {
 fn local_tone_curve(x_in: f32) -> f32 {
     let t = offset(P_LOCAL_TONE);
     var x = measured(t, t + 1536, delta[L_DEHAZE], x_in);
-    x = measured(t + 384, t + 1542, delta[L_CONTRAST], x);
+    let pivot = p(P_LOCAL_PIVOT);
+    if pivot < 0.0 {
+        x = measured(t + 384, t + 1542, delta[L_CONTRAST], x);
+        x = measured(t + 768, t + 1542, delta[L_WHITES], x);
+        return measured(t + 1152, t + 1542, delta[L_BLACKS], x);
+    }
     x = measured(t + 768, t + 1542, delta[L_WHITES], x);
-    return measured(t + 1152, t + 1542, delta[L_BLACKS], x);
+    x = measured(t + 1152, t + 1542, delta[L_BLACKS], x);
+    return contrast_at(t + 1548, table(t + 1932), pivot, t + 1542, delta[L_CONTRAST], x);
+}
+// basic_tone::contrast_at: the chart's Contrast table at `t` (pivoting at `chart`)
+// moved to `pivot` by a power warp of gamma-2.2 encoded values.
+fn contrast_at(t: i32, chart: f32, pivot: f32, values: i32, s: f32, x: f32) -> f32 {
+    if s == 0.0 {
+        return x;
+    }
+    let k = log(gamma22(chart)) / log(gamma22(pivot));
+    let y = measured(t, values, s, from_gamma22(powf(gamma22(x), k)));
+    return from_gamma22(powf(gamma22(y), 1.0 / k));
+}
+fn gamma22(v: f32) -> f32 {
+    return powf(srgb_decode(clamp(v, 0.0, 1.0)), 1.0 / 2.2);
+}
+fn from_gamma22(w: f32) -> f32 {
+    return srgb_encode(powf(clamp(w, 0.0, 1.0), 2.2));
 }
 fn local_gain(pos: vec2<f32>, rgb: vec3<f32>) -> f32 {
     let w = u32(p(P_LOCAL_SIZE));
@@ -415,13 +437,21 @@ fn local_gain(pos: vec2<f32>, rgb: vec3<f32>) -> f32 {
     }
     let y = max(0.2126 * rgb.x + 0.7152 * rgb.y + 0.0722 * rgb.z, 6e-4);
     let base = coef.x * log2(y) + coef.y;
+    // The measured positive Clarity (clarity.rs), on the same grid.
+    var clarity = 0.0;
+    let c = offset(P_LOCAL_A + 2u);
+    if c >= 0 {
+        let top = table(c + i32(iy * w + ix)) * (1.0 - tx) + table(c + i32(iy * w + jx)) * tx;
+        let bottom = table(c + i32(jy * w + ix)) * (1.0 - tx) + table(c + i32(jy * w + jx)) * tx;
+        clarity = top * (1.0 - ty) + bottom * ty;
+    }
     if masked && (delta[L_SHADOWS] != 0.0 || delta[L_HIGHLIGHTS] != 0.0) {
         let s = p(P_GLOBAL_SH) + delta[L_SHADOWS];
         let h = p(P_GLOBAL_SH + 1u) + delta[L_HIGHLIGHTS];
         return exp2(family(0u, s, p(P_LOCAL_KEYS), base)
-            + family(1u, h, p(P_LOCAL_KEYS + 1u), base));
+            + family(1u, h, p(P_LOCAL_KEYS + 1u), base) + clarity);
     }
-    return exp2(local_curve(P_SHADOWS, base) + local_curve(P_HIGHLIGHTS, base));
+    return exp2(local_curve(P_SHADOWS, base) + local_curve(P_HIGHLIGHTS, base) + clarity);
 }
 fn parametric(x: f32) -> f32 {
     if p(P_PARAMETRIC_ON) == 0.0 {
@@ -495,6 +525,12 @@ fn reference_curves(rgb: vec3<f32>) -> vec3<f32> {
         q = rgb_tone_values(q, local_tone_curve(lo), local_tone_curve(hi), lo, hi);
     }
     q = vec3(level(q.x), level(q.y), level(q.z));
+    let parametric = offset(P_PARAMETRIC_LUT);
+    if parametric >= 0 {
+        let lo = min(min(q.x, q.y), q.z);
+        let hi = max(max(max(q.x, q.y), q.z), 0.0);
+        q = rgb_tone_values(q, lut(parametric, 1024u, lo), lut(parametric, 1024u, hi), lo, hi);
+    }
     let lo = min(min(q.x, q.y), q.z);
     let hi = max(max(max(q.x, q.y), q.z), 0.0);
     let master = offset(P_MASTER);
@@ -574,11 +610,22 @@ fn point_ramp(x: f32, at: i32, rise: f32, fall: f32) -> f32 {
     }
     return min(up, down);
 }
+// Visualize Range's selection of this pixel, or -1 without it.
+var<private> point_selection: f32;
+// point_color::visualize, on the finished color.
+fn visualize(out: vec3<f32>) -> vec3<f32> {
+    let y = 0.2126 * srgb_decode(out.x) + 0.7152 * srgb_decode(out.y) + 0.0722 * srgb_decode(out.z);
+    let gray = srgb_encode(y);
+    return vec3(gray) + (out - vec3(gray)) * point_selection;
+}
 // One swatch at table offset `w`, on linear ProPhoto RGB.
 fn point_color(p0: vec3<f32>, w: i32, base: i32) -> vec3<f32> {
     let q = max(p0, vec3(0.0));
     let max_v = max(max(q.x, q.y), q.z);
     if max_v <= 1e-6 {
+        if table(w + 22) != 0.0 {
+            point_selection = 0.0;
+        }
         return p0;
     }
     let min_v = min(min(q.x, q.y), q.z);
@@ -596,6 +643,10 @@ fn point_color(p0: vec3<f32>, w: i32, base: i32) -> vec3<f32> {
         * point_ramp(sat + (s - sat) * table(w + 4), w + 10, table(base + 1), table(base + 2))
         * point_ramp(lum + (ev - lum) * table(w + 5), w + 14, table(base + 3), table(base + 4))
         * min(s / table(base + 5), 1.0);
+    // Visualize Range: note the selection; the finished color is grayed by the rest.
+    if table(w + 22) != 0.0 {
+        point_selection = weight;
+    }
     if weight <= 0.0 {
         return p0;
     }
@@ -620,7 +671,7 @@ fn point_colors(rgb: vec3<f32>) -> vec3<f32> {
     let base = offset(P_POINT);
     var q = RGB_TO_PRO * rgb;
     for (var i = 0u; i < u32(p(P_POINT + 1u)); i++) {
-        q = point_color(q, base + 8 + i32(i) * 22, base);
+        q = point_color(q, base + POINT_CONSTANTS + i32(i) * POINT_SWATCH, base);
     }
     return PRO_TO_RGB * q;
 }
@@ -730,7 +781,25 @@ fn grade_at(base: i32, l: f32) -> vec3<f32> {
     let t = f - f32(i);
     return table3(base + i32(i) * 3) * (1.0 - t) + table3(base + i32(i + 1u) * 3) * t;
 }
+// color_grade_curves::ChannelCurves: a gain curve per channel of linear ProPhoto RGB.
+fn grade_channels(rgb: vec3<f32>) -> vec3<f32> {
+    let bins = u32(p(P_GRADE + 2u));
+    let base = offset(P_GRADE);
+    let q = RGB_TO_PRO * rgb;
+    var out: vec3<f32>;
+    for (var c = 0; c < 3; c++) {
+        let f = powf(clamp(q[c], 0.0, 1.0), 1.0 / 2.2) * f32(bins - 1u);
+        let i = min(u32(f), bins - 2u);
+        let t = f - f32(i);
+        let g = table(base + i32(i) * 3 + c) * (1.0 - t) + table(base + i32(i + 1u) * 3 + c) * t;
+        out[c] = q[c] * g;
+    }
+    return PRO_TO_RGB * out;
+}
 fn grade(rgb: vec3<f32>) -> vec3<f32> {
+    if p(P_GRADE + 3u) == 1.0 {
+        return grade_channels(rgb);
+    }
     let y = max(0.2126 * rgb.x + 0.7152 * rgb.y + 0.0722 * rgb.z, 0.0);
     let l = srgb_encode(min(y, 1.0));
     let g = grade_at(offset(P_GRADE), l);
@@ -834,6 +903,7 @@ fn adjust(lab_in: vec3<f32>) -> vec3<f32> {
     return lab;
 }
 fn process_pixel(sample: vec3<f32>, pos: vec2<f32>) -> vec3<f32> {
+    point_selection = -1.0;
     // tone_stage
     var wb = vec3(1.0);
     if masked {
@@ -905,7 +975,12 @@ fn process_pixel(sample: vec3<f32>, pos: vec2<f32>) -> vec3<f32> {
     let l = clamp(lab.x, 0.0, 1.0);
     let gray = l * l * l;
     var gamut = 1.0;
+    // GamutModel::Clip: each channel clipped on its own, as Camera Raw does.
+    let clip = p(P_GAMUT_CLIP) != 0.0;
     for (var k = 0; k < 3; k++) {
+        if clip {
+            break;
+        }
         let v = rgb[k];
         if v < 0.0 {
             gamut = min(gamut, gray / max(gray - v, 1e-8));
@@ -916,7 +991,10 @@ fn process_pixel(sample: vec3<f32>, pos: vec2<f32>) -> vec3<f32> {
     }
     var out: vec3<f32>;
     for (var k = 0; k < 3; k++) {
-        out[k] = clamp(srgb_encode(gray + (rgb[k] - gray) * gamut), 0.0, 1.0);
+        out[k] = clamp(srgb_encode(select(gray + (rgb[k] - gray) * gamut, clamp(rgb[k], 0.0, 1.0), clip)), 0.0, 1.0);
+    }
+    if point_selection >= 0.0 {
+        out = visualize(out);
     }
     return out;
 }

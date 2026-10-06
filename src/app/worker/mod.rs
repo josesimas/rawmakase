@@ -37,7 +37,16 @@ impl RenderStage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskKind {
     Load,
-    Render,
+    Render(Pane),
+}
+/// Which view of the edit a render is for: the edit itself, or the Before beside it
+/// in Lightroom's Before/After views. Each has its own render lane and caches, so an
+/// edit renders only the After.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Pane {
+    #[default]
+    After,
+    Before,
 }
 
 /// What an Auto request sets.
@@ -65,6 +74,25 @@ pub enum Event {
         errors: Vec<String>,
     },
     PresetLoad(PathBuf),
+    /// Point Color's dropper sample for the photo loaded as `id`, taken with
+    /// `sampled`: a swatch's `source`, or what to say instead.
+    PointColorSample {
+        id: u64,
+        /// The sampling task's generation; a later sample or a put-away dropper
+        /// supersedes it.
+        generation: u64,
+        sampled: Box<crate::develop::Recipe>,
+        result: Result<[f32; 3], String>,
+    },
+    /// The Targeted Adjustment Tool's sample for the photo loaded as `id`, taken
+    /// with `sampled` where a drag started, or what to say instead.
+    TargetedSample {
+        id: u64,
+        /// The sampling task's generation; a later drag supersedes it.
+        generation: u64,
+        sampled: Box<crate::develop::Recipe>,
+        result: Result<crate::develop::targeted::TargetSample, String>,
+    },
     /// An Auto estimate for the photo loaded as `id`.
     Auto {
         id: u64,
@@ -103,6 +131,7 @@ pub enum Event {
     },
     Rendered {
         id: u64,
+        pane: Pane,
         preview: Preview,
         histogram: Box<crate::develop::Histogram>,
         /// A reduced copy for the library, without overlays, when the job asked for one.
@@ -126,6 +155,11 @@ pub enum Event {
     /// previews were presented into: stop drawing them, then drop this to free them.
     RendererReset(RetiredTextures),
     Exported(String),
+    /// Develop's Reference View photo, developed (half-size, then full), or why not.
+    Reference {
+        ticket: u64,
+        result: Result<Box<ReferenceImage>, String>,
+    },
 }
 /// Textures the renderer registered with the UI and no longer uses. Freed when
 /// dropped, so the UI releases them only once it no longer draws them.
@@ -190,6 +224,7 @@ pub enum Overlay {
 }
 pub struct RenderJob {
     pub id: u64,
+    pub pane: Pane,
     pub image: Arc<CameraImage>,
     pub max_edge: u32,
     pub cancel: Arc<AtomicBool>,
@@ -215,9 +250,11 @@ fn send(tx: &Sender<Event>, ctx: &egui::Context, event: Event) {
 
 mod latest;
 mod loader;
+mod reference;
 mod renderer;
 pub use latest::Latest;
 pub(crate) use latest::panic_message;
 pub use loader::loader;
-pub use renderer::renderer;
+pub(in crate::app) use reference::{ReferenceImage, ReferenceJob, Resolution, reference_loader};
 pub(super) use renderer::{RenderBackend, renderer_with_backend};
+pub use renderer::{Renderer, renderer};

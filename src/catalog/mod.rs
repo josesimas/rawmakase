@@ -32,6 +32,7 @@ mod ingest;
 pub mod lightroom;
 pub mod migrate;
 mod models;
+pub mod resolve;
 pub mod server;
 mod sidecar;
 mod snapshots;

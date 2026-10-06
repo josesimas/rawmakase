@@ -3,19 +3,25 @@ use super::bulk_import::ImportKind;
 use super::clipping::{self, ClipSide};
 use super::crop_tool::{Guide, GuideShow, Ruler};
 use super::dialogs::FileDialog;
-use super::state::Tool;
+use super::state::{MixerTab, Tool};
+use super::targeted_tool::{hsl_target, target_button};
 use super::tone_drag::tone_drag_ui;
 use super::widgets::{
     SliderEvent, adjustment_section, name_history_step, parametric_curve_ui, segmented, slider,
-    slider_with, tone_curve_ui, toolbar_action,
+    slider_with, switched_section, tone_curve_ui, toolbar_action,
 };
 use super::worker::AutoKind;
 use crate::app::icons::{self, Icon};
 use crate::app::theme;
+use crate::develop::panels::{Panel, PanelState};
+use crate::develop::sharpening::{SharpeningModel, SharpeningSliders};
+use crate::develop::targeted::Target;
 use crate::develop::{
     NamedWhiteBalance, Recipe, TEMPERATURE_MAX, TEMPERATURE_MIN, TINT_LIMIT, Treatment,
 };
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
+
+mod lens_profile;
 
 /// A histogram corner's clipping triangle: its corner point, which way it
 /// points (1 right, -1 left) and the area that takes its clicks.
@@ -165,24 +171,27 @@ impl Editor {
                 region.display(region.value(&self.document.recipe))
             )
         });
-        let exif = region_text.unwrap_or_else(|| {
-            self.document
-                .metadata
-                .as_ref()
-                .map_or_else(String::new, |m| {
-                    let info = crate::catalog::PhotoInfo::from_metadata(m);
-                    [
-                        info.iso_text(),
-                        info.focal_text(),
-                        info.aperture_text(),
-                        info.shutter_text(),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-                    .join("     ")
-                })
-        });
+        // So does the RGB readout while the pointer is over the photo.
+        let exif = region_text
+            .or_else(|| self.view.readout.text())
+            .unwrap_or_else(|| {
+                self.document
+                    .metadata
+                    .as_ref()
+                    .map_or_else(String::new, |m| {
+                        let info = crate::catalog::PhotoInfo::from_metadata(m);
+                        [
+                            info.iso_text(),
+                            info.focal_text(),
+                            info.aperture_text(),
+                            info.shutter_text(),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join("     ")
+                    })
+            });
         ui.vertical_centered(|ui| {
             ui.label(egui::RichText::new(exif).size(11.).color(theme::gray(170)))
                 .on_hover_text("Output histogram of the whole photo");
@@ -477,6 +486,13 @@ impl Editor {
             .pending_treatment
             .as_ref()
             .map(|p| p.treatment);
+        let grading_document = self.document.history.id();
+        let saved_curves = self.saved_curves();
+        let mut curve_choice = None;
+        // The Targeted Adjustment Tool: the sliders a drag is moving, and a target
+        // button's click.
+        let targeted = self.targeted_weights();
+        let mut targeted_request = None;
         let view = &mut self.view;
         let (r, photo) = self.document.recipe_and_colors();
 
@@ -729,7 +745,9 @@ impl Editor {
             slider(ui, "Blacks", &mut r.blacks, -1. ..=1., 0.);
             subheading(ui, "Presence");
             slider(ui, "Texture", &mut r.effects.texture, -1. ..=1., 0.);
+            let previous_clarity = r.effects.clarity;
             slider(ui, "Clarity", &mut r.effects.clarity, -1. ..=1., 0.);
+            r.adopt_measured_clarity(previous_clarity);
             slider(ui, "Dehaze", &mut r.effects.dehaze, -1. ..=1., 0.);
             slider(ui, "Vibrance", &mut r.vibrance, -1. ..=1., 0.);
             slider(ui, "Saturation", &mut r.saturation, -1. ..=1., 0.);
@@ -753,14 +771,24 @@ impl Editor {
             r.blacks = 0.;
         }
 
-        if adjustment_section(ui, "Tone Curve", |ui| {
+        let mut switch = PanelSwitch::new(r, Panel::ToneCurve);
+        if switched_section(ui, "Tone Curve", &mut switch.state, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.;
+                let (button, _) = ui.allocate_exact_size(Vec2::new(22., 22.), Sense::hover());
+                if target_button(
+                    ui,
+                    button,
+                    view.is(Tool::Targeted(Target::ToneCurve)),
+                    &format!("Targeted adjustment: drag up or down on the photo to move the region of the tone curve there · {}", targeted_shortcut("T")),
+                ) {
+                    targeted_request = Some(Target::ToneCurve);
+                }
                 segmented(
                     ui,
                     &mut view.parametric_curve,
                     &[(true, "Parametric"), (false, "Point")],
-                    128.,
+                    112.,
                 );
                 if !view.parametric_curve {
                     let w = ui.available_width();
@@ -774,7 +802,14 @@ impl Editor {
             });
             ui.add_space(4.);
             if view.parametric_curve {
-                parametric_curve_ui(ui, &mut r.effects, &histogram);
+                let moving = targeted.filter(|w| w.target == Target::ToneCurve);
+                parametric_curve_ui(
+                    ui,
+                    &mut r.effects,
+                    r.parametric_model,
+                    &histogram,
+                    moving.and_then(|w| (0..4).find(|i| w.shares[*i] > 0.)),
+                );
                 subheading(ui, "Region");
                 for (i, name) in [
                     (3, "Highlights"),
@@ -782,9 +817,10 @@ impl Editor {
                     (1, "Darks"),
                     (0, "Shadows"),
                 ] {
-                    ui.push_id(("parametric", i), |ui| {
+                    let row = ui.push_id(("parametric", i), |ui| {
                         slider(ui, name, &mut r.effects.parametric[i], -1. ..=1., 0.)
                     });
+                    highlight_targeted(ui, row.response.rect, moving.map_or(0., |w| w.shares[i]));
                 }
             } else {
                 ui.push_id(view.selected_curve, |ui| {
@@ -798,6 +834,51 @@ impl Editor {
                         &histogram,
                         view.selected_curve,
                     );
+                });
+                // Lightroom's Point Curve menu: the built-in curves, saved ones, Save….
+                use crate::presets::curves::ShownCurve;
+                let chosen = ShownCurve::of(r, &saved_curves);
+                let shown = chosen.name(&saved_curves).to_string();
+                control_row(ui, "Point Curve", |ui| {
+                    egui::ComboBox::from_id_salt("point-curve")
+                        .width(ui.available_width())
+                        .selected_text(&shown)
+                        .show_ui(ui, |ui| {
+                            use super::curve_menu::CurveChoice;
+                            use crate::presets::curves::BuiltinCurve;
+                            for curve in BuiltinCurve::ALL {
+                                if ui
+                                    .selectable_label(
+                                        chosen == ShownCurve::Builtin(curve),
+                                        curve.name(),
+                                    )
+                                    .clicked()
+                                {
+                                    curve_choice = Some(CurveChoice::Builtin(curve));
+                                }
+                            }
+                            if !saved_curves.is_empty() {
+                                ui.separator();
+                            }
+                            for (i, saved) in saved_curves.iter().enumerate() {
+                                if ui
+                                    .selectable_label(chosen == ShownCurve::Saved(i), &saved.name)
+                                    .clicked()
+                                {
+                                    curve_choice = Some(CurveChoice::Saved(saved.clone()));
+                                }
+                            }
+                            ui.separator();
+                            if ui
+                                .selectable_label(false, "Save…")
+                                .on_hover_text(
+                                    "Save the RGB, Red, Green and Blue curves under a name",
+                                )
+                                .clicked()
+                            {
+                                curve_choice = Some(CurveChoice::Save);
+                            }
+                        });
                 });
                 // Lightroom's Refine Saturation, under the RGB point curve it acts on;
                 // the channel curves keep the same height so nothing below moves.
@@ -838,12 +919,18 @@ impl Editor {
             r.curve_saturation = 1.;
             r.effects.parametric = [0.; 4];
         }
+        switch.finish(r);
 
         // The B&W panel replaces the Color Mixer whenever the photo renders black &
         // white, by its Treatment or by a black & white profile.
         let black_white = r.treatment() == Treatment::BlackWhite;
-        let mixer_title = if black_white { "B&W" } else { "Color Mixer" };
-        if adjustment_section(ui, mixer_title, |ui| {
+        let (mixer_title, mixer_panel) = if black_white {
+            ("B&W", Panel::BlackWhiteMix)
+        } else {
+            ("Color Mixer", Panel::ColorMixer)
+        };
+        let mut switch = PanelSwitch::new(r, mixer_panel);
+        if switched_section(ui, mixer_title, &mut switch.state, |ui| {
             if black_white {
                 let heading = subheading(ui, "Black & White Mix");
                 // Measured (once) only while this panel is open.
@@ -875,8 +962,24 @@ impl Editor {
                 {
                     auto_mix_request = true;
                 }
+                let target = Rect::from_min_size(
+                    Pos2::new(button.left() - 28., button.top() + 1.),
+                    Vec2::splat(22.),
+                );
+                if target_button(
+                    ui,
+                    target,
+                    view.is(Tool::Targeted(Target::BlackWhite)),
+                    &format!(
+                        "Targeted adjustment: drag up or down on the photo to brighten or darken its color · {}",
+                        targeted_shortcut("G")
+                    ),
+                ) {
+                    targeted_request = Some(Target::BlackWhite);
+                }
+                let moving = targeted.filter(|w| w.target == Target::BlackWhite);
                 for (i, name) in BANDS.iter().enumerate() {
-                    ui.push_id(("bw", i), |ui| {
+                    let row = ui.push_id(("bw", i), |ui| {
                         slider_with(
                             ui,
                             name,
@@ -887,7 +990,32 @@ impl Editor {
                             Some((theme::gray(40), band_color(i))),
                         )
                     });
+                    highlight_targeted(ui, row.response.rect, moving.map_or(0., |w| w.shares[i]));
                 }
+                return;
+            }
+            // Lightroom's tabs: the HSL and Color mixer, and Point Color.
+            ui.horizontal(|ui| {
+                let w = ui.available_width();
+                segmented(
+                    ui,
+                    &mut view.mixer_tab,
+                    &[
+                        (MixerTab::Mixer, "Mixer"),
+                        (MixerTab::PointColor, "Point Color"),
+                    ],
+                    w,
+                );
+            });
+            if view.mixer_tab == MixerTab::PointColor {
+                // Only the current process renders Point Color.
+                let supported = super::point_color_panel::renders_point_color(r);
+                if !supported {
+                    hint_row(ui, "Update the process in Calibration to use Point Color.");
+                }
+                ui.add_enabled_ui(supported, |ui| {
+                    super::point_color_panel::point_color_panel(ui, &mut r.point_colors, view)
+                });
                 return;
             }
             control_row(ui, "Mixer", |ui| {
@@ -932,7 +1060,29 @@ impl Editor {
                     }
                 });
             } else {
+                let all = view.mixer_adjust == 3;
+                let channel_tip = |c: usize| {
+                    let name = ["hue", "saturation", "luminance"][c];
+                    format!(
+                        "Targeted adjustment: drag up or down on the photo to change its color's {name} · {}",
+                        targeted_shortcut(["H", "S", "L"][c])
+                    )
+                };
                 control_row(ui, "Adjust", |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.;
+                    if !all {
+                        let (button, _) =
+                            ui.allocate_exact_size(Vec2::new(22., 22.), Sense::hover());
+                        let target = hsl_target(view.mixer_adjust);
+                        if target_button(
+                            ui,
+                            button,
+                            view.is(Tool::Targeted(target)),
+                            &channel_tip(view.mixer_adjust),
+                        ) {
+                            targeted_request = Some(target);
+                        }
+                    }
                     let w = ui.available_width();
                     segmented(
                         ui,
@@ -941,17 +1091,33 @@ impl Editor {
                         w,
                     );
                 });
-                let channels = if view.mixer_adjust == 3 {
+                // Again after the tabs, which may have just changed.
+                let all = view.mixer_adjust == 3;
+                let channels = if all {
                     0..3
                 } else {
                     view.mixer_adjust..view.mixer_adjust + 1
                 };
                 for c in channels {
-                    if view.mixer_adjust == 3 {
-                        subheading(ui, ["Hue", "Saturation", "Luminance"][c]);
+                    let target = hsl_target(c);
+                    if all {
+                        let heading = subheading(ui, ["Hue", "Saturation", "Luminance"][c]);
+                        let button = Rect::from_min_size(
+                            Pos2::new(heading.right() - 24., heading.top() - 3.),
+                            Vec2::splat(22.),
+                        );
+                        if target_button(
+                            ui,
+                            button,
+                            view.is(Tool::Targeted(target)),
+                            &channel_tip(c),
+                        ) {
+                            targeted_request = Some(target);
+                        }
                     }
+                    let moving = targeted.filter(|w| w.target == target);
                     for (i, name) in BANDS.iter().enumerate() {
-                        ui.push_id(("hsl-all", c, i), |ui| {
+                        let row = ui.push_id(("hsl-all", c, i), |ui| {
                             slider_with(
                                 ui,
                                 name,
@@ -962,6 +1128,11 @@ impl Editor {
                                 Some(hsl_gradient(i, c)),
                             );
                         });
+                        highlight_targeted(
+                            ui,
+                            row.response.rect,
+                            moving.map_or(0., |w| w.shares[i]),
+                        );
                     }
                 }
             }
@@ -969,78 +1140,36 @@ impl Editor {
             if black_white {
                 r.effects.gray_mix = [0.; 8];
             } else {
+                // Both tabs: the mixer and Point Color.
                 r.hsl = [[0.; 3]; 8];
+                r.point_colors.clear();
             }
         }
+        switch.finish(r);
 
-        if adjustment_section(ui, "Color Grading", |ui| {
-            ui.horizontal(|ui| {
-                let w = ui.available_width();
-                segmented(
-                    ui,
-                    &mut view.selected_grade,
-                    &[
-                        (0, "Shadows"),
-                        (1, "Midtones"),
-                        (2, "Highlights"),
-                        (3, "Global"),
-                    ],
-                    w,
-                );
+        let mut switch = PanelSwitch::new(r, Panel::ColorGrading);
+        if switched_section(ui, "Color Grading", &mut switch.state, |ui| {
+            ui.push_id(grading_document, |ui| {
+                super::color_grading::color_grading_ui(ui, r, &mut view.grading);
             });
-            let i = view.selected_grade;
-            let grade = if i == 3 {
-                &mut r.effects.global_grade
-            } else {
-                &mut r.grading[i]
-            };
-            ui.push_id(("grade", i), |ui| {
-                let mut degrees = grade[0] * 360.;
-                slider(ui, "Hue", &mut degrees, 0. ..=360., 0.);
-                if degrees != grade[0] * 360. {
-                    grade[0] = degrees / 360.;
-                }
-                let tint = crate::develop::color::hue_rgb(grade[0]).map(|v| (v * 180.) as u8);
-                slider_with(
-                    ui,
-                    "Saturation",
-                    &mut grade[1],
-                    0. ..=1.,
-                    0.,
-                    None,
-                    Some((
-                        theme::gray(90),
-                        Color32::from_rgb(tint[0], tint[1], tint[2]),
-                    )),
-                );
-                slider_with(
-                    ui,
-                    "Luminance",
-                    &mut grade[2],
-                    -1. ..=1.,
-                    0.,
-                    None,
-                    Some((theme::gray(25), theme::gray(210))),
-                );
-            });
-            ui.add_space(4.);
-            slider(ui, "Blending", &mut r.effects.blending, 0. ..=1., 0.5);
-            slider(ui, "Balance", &mut r.effects.balance, -1. ..=1., 0.);
         }) {
             r.grading = [[0.; 3]; 3];
             r.effects.global_grade = [0.; 3];
             r.effects.balance = 0.;
             r.effects.blending = 0.5;
         }
+        switch.finish(r);
 
-        if adjustment_section(ui, "Detail", |ui| {
+        let mut switch = PanelSwitch::new(r, Panel::Detail);
+        let sharpening = SharpeningSliders::defaults(r.sharpening_model);
+        if switched_section(ui, "Detail", &mut switch.state, |ui| {
             subheading(ui, "Sharpening");
             slider_with(
                 ui,
                 "Amount",
                 &mut r.sharpening,
                 0. ..=1.,
-                0.35,
+                sharpening.amount,
                 Some((150., 0)),
                 None,
             );
@@ -1050,12 +1179,24 @@ impl Editor {
                     "Radius",
                     &mut r.sharpening_radius,
                     0.5..=3.,
-                    0.8,
+                    sharpening.radius,
                     Some((1., 1)),
                     None,
                 );
-                slider(ui, "Detail", &mut r.sharpening_detail, 0. ..=1., 0.25);
-                slider(ui, "Masking", &mut r.sharpening_masking, 0. ..=1., 0.35);
+                slider(
+                    ui,
+                    "Detail",
+                    &mut r.sharpening_detail,
+                    0. ..=1.,
+                    sharpening.detail,
+                );
+                slider(
+                    ui,
+                    "Masking",
+                    &mut r.sharpening_masking,
+                    0. ..=1.,
+                    sharpening.masking,
+                );
             }
             subheading(ui, "Noise Reduction");
             slider(ui, "Luminance", &mut r.noise_luma, 0. ..=1., 0.);
@@ -1082,16 +1223,14 @@ impl Editor {
             r.effects.luma_contrast = d.luma_contrast;
             r.effects.chroma_detail = d.chroma_detail;
             r.effects.chroma_smoothness = d.chroma_smoothness;
-            r.sharpening = if r.engine >= 3 { 0.35 } else { 0. };
-            r.sharpening_radius = 0.8;
-            r.sharpening_detail = 0.25;
-            r.sharpening_masking = 0.35;
+            // Reset brings the current defaults, with the measured operator.
+            r.set_sharpening_defaults(SharpeningModel::Measured);
         }
+        switch.finish(r);
 
-        if adjustment_section(ui, "Lens Corrections", |ui| {
+        let mut switch = PanelSwitch::new(r, Panel::LensCorrections);
+        if switched_section(ui, "Lens Corrections", &mut switch.state, |ui| {
             subheading(ui, "Profile");
-            let builtin = metadata.as_ref().and_then(|m| m.lens.as_ref());
-            let adobe = metadata.as_ref().and_then(|m| m.profile_lens.as_ref());
             ui.add_enabled_ui(r.engine >= 4, |ui| {
                 control_row(ui, "", |ui| {
                     ui.checkbox(&mut r.lens_ca, "Remove Chromatic Aberration")
@@ -1127,17 +1266,7 @@ impl Editor {
                         .color(theme::gray(200)),
                 );
             });
-            control_row(ui, "Profile", |ui| {
-                ui.label(
-                    egui::RichText::new(
-                        adobe
-                            .or(builtin)
-                            .map_or("No matching profile", |l| l.source.as_str()),
-                    )
-                    .size(11.)
-                    .color(theme::gray(200)),
-                );
-            });
+            lens_profile::profile_menus(ui, r, metadata.as_ref());
             // Said here as well as on import, so a missing profile is never silent.
             if let Some(missing) = metadata.as_ref().and_then(|m| r.missing_lens_profile(m)) {
                 control_row(ui, "", |ui| {
@@ -1218,6 +1347,7 @@ impl Editor {
             }
             defringe_sliders(ui, &mut r.effects);
             subheading(ui, "Vignetting");
+            let previous_vignette = r.effects.lens_vignette;
             ui.push_id("lens-vignette", |ui| {
                 slider(ui, "Amount", &mut r.effects.lens_vignette, -1. ..=1., 0.);
                 slider(
@@ -1228,6 +1358,7 @@ impl Editor {
                     0.5,
                 );
             });
+            r.adopt_measured_vignette(previous_vignette);
         }) {
             if let Some(m) = &metadata {
                 r.lens_builtin = m.lens.as_ref().is_none_or(|l| l.default_on);
@@ -1235,6 +1366,7 @@ impl Editor {
             let defaults = Recipe::default();
             r.lens_ca = defaults.lens_ca;
             r.lens_profile = defaults.lens_profile;
+            r.lens_profile_choice = defaults.lens_profile_choice;
             r.lens_distortion = defaults.lens_distortion;
             r.lens_vignetting = defaults.lens_vignetting;
             r.lens_manual_distortion = defaults.lens_manual_distortion;
@@ -1244,8 +1376,10 @@ impl Editor {
             r.effects.lens_vignette = d.lens_vignette;
             r.effects.lens_vignette_midpoint = d.lens_vignette_midpoint;
         }
+        switch.finish(r);
 
-        if adjustment_section(ui, "Transform", |ui| {
+        let mut switch = PanelSwitch::new(r, Panel::Transform);
+        if switched_section(ui, "Transform", &mut switch.state, |ui| {
             let supported = r.engine >= 4;
             if !supported {
                 hint_row(ui, "Update the process in Calibration to use Transform.");
@@ -1351,8 +1485,10 @@ impl Editor {
             r.upright = Default::default();
             r.constrain_crop = false;
         }
+        switch.finish(r);
 
-        if adjustment_section(ui, "Effects", |ui| {
+        let mut switch = PanelSwitch::new(r, Panel::Effects);
+        if switched_section(ui, "Effects", &mut switch.state, |ui| {
             subheading(ui, "Post-Crop Vignetting");
             slider(ui, "Amount", &mut r.effects.vignette, -1. ..=1., 0.);
             slider(
@@ -1370,6 +1506,7 @@ impl Editor {
                 0.5,
             );
             subheading(ui, "Grain");
+            let previous_grain = r.effects.grain;
             ui.push_id("grain", |ui| {
                 slider(ui, "Amount", &mut r.effects.grain, 0. ..=1., 0.);
                 slider(ui, "Size", &mut r.effects.grain_size, 0. ..=1., 0.25);
@@ -1381,11 +1518,14 @@ impl Editor {
                     0.5,
                 );
             });
+            r.adopt_measured_grain(previous_grain);
         }) {
             r.effects.reset_post_crop();
         }
+        switch.finish(r);
 
-        if adjustment_section(ui, "Calibration", |ui| {
+        let mut switch = PanelSwitch::new(r, Panel::Calibration);
+        if switched_section(ui, "Calibration", &mut switch.state, |ui| {
             subheading(ui, "Process");
             if r.engine < 4 {
                 ui.horizontal(|ui| {
@@ -1397,13 +1537,7 @@ impl Editor {
                         )
                         .clicked()
                     {
-                        if r.engine < 3 {
-                            r.profile = metadata.as_ref().and_then(crate::camera_profiles::builtin);
-                            if r.sharpening == 0. {
-                                r.sharpening = 0.35;
-                            }
-                        }
-                        r.engine = 4;
+                        r.update_process(metadata.as_ref());
                     }
                 });
             } else {
@@ -1477,6 +1611,7 @@ impl Editor {
             r.effects.calibration = [[0.; 2]; 3];
             r.effects.shadow_tint = 0.;
         }
+        switch.finish(r);
         if let Some(kind) = auto_request {
             self.start_auto(kind);
         }
@@ -1488,6 +1623,12 @@ impl Editor {
         }
         if auto_mix_request {
             self.auto_black_white_mix();
+        }
+        if let Some(choice) = curve_choice {
+            self.choose_point_curve(choice);
+        }
+        if let Some(target) = targeted_request {
+            self.toggle_targeted(target);
         }
         if upright_request {
             self.start_upright();
@@ -1576,7 +1717,7 @@ pub(super) const ASPECTS: [(f32, &str); 9] = [
     (16. / 9., "16 x 9"),
     (65. / 24., "65 x 24 (XPan)"),
 ];
-const BANDS: [&str; 8] = [
+pub(super) const BANDS: [&str; 8] = [
     "Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple", "Magenta",
 ];
 fn band_color(i: usize) -> Color32 {
@@ -1599,6 +1740,44 @@ fn hsl_gradient(band: usize, channel: usize) -> (Color32, Color32) {
         0 => (band_color((band + 7) % 8), band_color((band + 1) % 8)),
         1 => (theme::gray(110), color),
         _ => (theme::gray(25), color.lerp_to_gamma(Color32::WHITE, 0.45)),
+    }
+}
+/// A panel's switch while its section is drawn; a click on it is stored after.
+pub(super) struct PanelSwitch {
+    panel: Panel,
+    pub(super) state: PanelState,
+}
+impl PanelSwitch {
+    pub(super) fn new(r: &Recipe, panel: Panel) -> Self {
+        Self {
+            panel,
+            state: r.panels.state(panel),
+        }
+    }
+    pub(super) fn finish(self, r: &mut Recipe) {
+        r.panels.set(self.panel, self.state);
+    }
+}
+/// Marks a slider row a Targeted Adjustment Tool drag is moving, more strongly the
+/// larger its `share` of the drag.
+fn highlight_targeted(ui: &egui::Ui, row: Rect, share: f32) {
+    if share <= 0. {
+        return;
+    }
+    let painter = ui.painter();
+    painter.rect_filled(row, 3., Color32::from_white_alpha((6. + 16. * share) as u8));
+    painter.rect_filled(
+        Rect::from_min_size(row.left_top(), Vec2::new(3., row.height())),
+        1.5,
+        theme::gray(235).gamma_multiply(0.4 + 0.6 * share),
+    );
+}
+/// The Targeted Adjustment Tool's shortcut ending in `key`, as the tooltips show it.
+fn targeted_shortcut(key: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("⌘⌥⇧{key}")
+    } else {
+        format!("Ctrl+Alt+Shift+{key}")
     }
 }
 /// Group caption (Tone, Presence…) starting where the slider rails start.

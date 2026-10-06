@@ -12,7 +12,7 @@ impl Editor {
             return;
         }
         // With a brush tool open, [ and ] size the brush instead of rating the photo.
-        let brushing = !self.library_mode && matches!(self.view.tool, Tool::Remove | Tool::Mask);
+        let brushing = !self.library_mode && self.tool_has_size();
         // With the Crop tool open, X swaps the crop's orientation instead of rejecting.
         let cropping = !self.library_mode && self.view.is(Tool::Crop);
         let auto_advance = self.auto_advance;
@@ -23,47 +23,25 @@ impl Editor {
             })
             // Photo > Auto Advance: every key moves on, as Shift does.
             .map(|(edit, shift)| (edit, shift || auto_advance));
-        let Some(library) = &mut self.library else {
-            return;
-        };
-        if self.library_mode {
-            match shortcut {
-                Some((edit, advance)) => {
-                    // As Lightroom applies it: to the grid's selection, or
-                    // the photo a Loupe, Compare or Survey has active.
-                    match library.edit_shown(edit, advance) {
-                        Ok(_) => self.status = library.message.clone(),
-                        Err(e) => self.status = format!("Metadata could not be saved: {e}"),
-                    }
-                    // Logged now, as a Library change, whatever this frame does next.
-                    self.sync_undo();
-                }
-                None => library.selection_keys(ctx),
-            }
-            return;
+        // A spot resize still being grouped is logged before the rating it precedes.
+        if shortcut.is_some() {
+            self.finish_wheel_gesture();
         }
-        let (Some(id), Some((edit, advance))) = (self.document.catalog_photo, shortcut) else {
-            return;
-        };
-        match library.edit_metadata(id, edit, advance) {
-            Ok(next) => {
-                self.status = library.message.clone();
-                // Logged now, while this photo is still the one in Develop.
-                self.sync_undo();
-                if let Some(next) = next {
-                    self.develop_catalog_photo(next);
-                    if self.document.catalog_photo != Some(next)
-                        && let Some(library) = &mut self.library
-                    {
-                        library.make_active(id);
-                    }
-                }
+        if let Some((edit, advance)) = shortcut {
+            if self.library.is_some()
+                && let Err(error) = self.command_metadata(edit, None, advance)
+            {
+                self.status = format!("Metadata could not be saved: {}", error.message);
             }
-            Err(e) => self.status = format!("Metadata could not be saved: {e}"),
+        } else if self.library_mode
+            && let Some(library) = &mut self.library
+        {
+            library.selection_keys(ctx);
         }
     }
     pub(super) fn draw(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.control_commands(&ctx);
         self.events(&ctx);
         self.poll_updates(&ctx);
         self.themes.poll(&ctx);
@@ -79,7 +57,8 @@ impl Editor {
             || self.not_editable.is_some()
             || self.view.shortcuts
             || self.copy_dialog.is_some()
-            || self.preset_rename.is_some();
+            || self.preset_rename.is_some()
+            || self.curve_save_open();
         if !modal {
             self.metadata_shortcuts(&ctx);
             self.workspace_shortcuts(&ctx);
@@ -94,6 +73,7 @@ impl Editor {
         if self.onboarding.visible {
             self.onboarding_ui(ui);
         } else if self.library_mode {
+            self.left_develop();
             self.library_workspace(ui);
         } else {
             let frame = self.begin_edit_frame();
@@ -119,6 +99,8 @@ impl Editor {
             && library.take_reread_finished()
         {
             self.status = library.message.clone();
+            // Reading metadata can bring in the reference photo's Lightroom edit.
+            self.load_reference();
         }
         self.remove_copy_window(&ctx);
         self.read_metadata_window(&ctx);
@@ -126,6 +108,7 @@ impl Editor {
         self.shortcuts_window(&ctx);
         self.copy_dialog_window(&ctx);
         self.preset_rename_window(&ctx);
+        self.curve_save_window(&ctx);
         self.preferences_window(&ctx);
         self.export_windows(&ctx);
         self.update_notice(&ctx, modal || self.view.shortcuts);
@@ -141,6 +124,15 @@ impl Editor {
             && collapsed != self.collapsed
         {
             self.collapsed = collapsed;
+            let _ = self.save_session();
+        }
+        let solo = ctx.data(|d| {
+            d.get_temp::<std::collections::BTreeSet<String>>(super::widgets::solo_sections_id())
+        });
+        if let Some(solo) = solo
+            && solo != self.solo
+        {
+            self.solo = solo;
             let _ = self.save_session();
         }
         self.sync_undo();
@@ -458,12 +450,12 @@ impl Editor {
         // Develop's tools, Before view, clipping warning and preset preview
         // stay in Develop.
         if self.view.tool != Tool::None
-            || self.view.compare
+            || self.view.compare.shows_before()
             || self.view.clipping != Default::default()
             || self.presets.preview.is_some()
         {
             self.view.tool = Tool::None;
-            self.view.compare = false;
+            self.view.compare = Default::default();
             self.view.clipping.clear();
             self.presets.preview = None;
             self.schedule();
@@ -540,6 +532,7 @@ impl Editor {
             .min_size(180.)
             .max_size(500.)
             .show(ui, |ui| {
+                let _side = super::widgets::SectionSide::enter(ui, super::widgets::SectionGroup::LibraryLeft);
                 // In the Loupe, the Navigator controls the zoom: Develop's for
                 // a RAW, the same one for other photos.
                 let loupe = self.library.as_ref().is_some_and(|l| l.loupe_open());
@@ -575,6 +568,10 @@ impl Editor {
             .min_size(220.)
             .max_size(420.)
             .show(ui, |ui| {
+                let _side = super::widgets::SectionSide::enter(
+                    ui,
+                    super::widgets::SectionGroup::LibraryRight,
+                );
                 if let Some(library) = &mut self.library {
                     action = action.then(library.info_panel(ui));
                 }
@@ -664,12 +661,44 @@ impl Editor {
             let mut auto = false;
             let mut treatment = false;
             let mut export = None;
+            let mut transfer = None;
+            let mut targeted = None;
             ctx.input(|i| {
-                if i.key_pressed(egui::Key::ArrowRight) {
+                // Lightroom's Copy After's Settings to Before (←), Copy Before's to
+                // After (→) and Swap (↑), with Cmd+Option+Shift.
+                let m = i.modifiers;
+                if m.command && m.alt && m.shift {
+                    use super::before_after::Transfer;
+                    transfer = [
+                        (egui::Key::ArrowLeft, Transfer::AfterToBefore),
+                        (egui::Key::ArrowRight, Transfer::BeforeToAfter),
+                        (egui::Key::ArrowUp, Transfer::Swap),
+                    ]
+                    .into_iter()
+                    .find(|(key, _)| i.key_pressed(*key))
+                    .map(|(_, t)| t);
+                } else if i.key_pressed(egui::Key::ArrowRight) {
                     self.navigate(1);
-                }
-                if i.key_pressed(egui::Key::ArrowLeft) {
+                } else if i.key_pressed(egui::Key::ArrowLeft) {
                     self.navigate(-1);
+                }
+                // Y: Before/After left and right, Option+Y top and bottom, Shift+Y
+                // split. Option changes the typed letter on macOS, so match the
+                // physical key too.
+                let y = i.events.iter().any(|event| {
+                    matches!(event, egui::Event::Key { key, physical_key, pressed: true, repeat: false, .. }
+                        if *key == egui::Key::Y || *physical_key == Some(egui::Key::Y))
+                });
+                if y && !m.command {
+                    use super::before_after::{Axis, Compare};
+                    let view = if m.alt {
+                        Compare::SideBySide(Axis::TopBottom)
+                    } else if m.shift {
+                        Compare::Split(Axis::LeftRight)
+                    } else {
+                        Compare::SideBySide(Axis::LeftRight)
+                    };
+                    self.set_compare(self.view.compare.toggled(view));
                 }
                 if i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::C) {
                     copy = true;
@@ -699,8 +728,34 @@ impl Editor {
                 if i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::N) {
                     new_preset = true;
                 }
+                // Lightroom's Targeted Adjustment Tools: Cmd+Option+Shift and T (Tone
+                // Curve), H, S, L (the Color Mixer's Hue, Saturation, Luminance) or G
+                // (B&W). Option changes the typed letter on macOS, so match the
+                // physical key too.
+                if i.modifiers.command && i.modifiers.alt && i.modifiers.shift {
+                    use crate::develop::targeted::{HslChannel, Target};
+                    for (key, target) in [
+                        (egui::Key::T, Target::ToneCurve),
+                        (egui::Key::H, Target::Hsl(HslChannel::Hue)),
+                        (egui::Key::S, Target::Hsl(HslChannel::Saturation)),
+                        (egui::Key::L, Target::Hsl(HslChannel::Luminance)),
+                        (egui::Key::G, Target::BlackWhite),
+                    ] {
+                        let pressed = i.events.iter().any(|event| {
+                            matches!(event, egui::Event::Key { key: k, physical_key, pressed: true, repeat: false, .. }
+                                if *k == key || *physical_key == Some(key))
+                        });
+                        if pressed {
+                            targeted = Some(target);
+                        }
+                    }
+                }
                 // Lightroom's Sync Settings.
-                if i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::S) {
+                if i.modifiers.command
+                    && i.modifiers.shift
+                    && !i.modifiers.alt
+                    && i.key_pressed(egui::Key::S)
+                {
                     sync = true;
                 }
                 if i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::R) {
@@ -741,17 +796,37 @@ impl Editor {
                 {
                     self.redo();
                 }
-                if (i.key_pressed(egui::Key::C) || i.key_pressed(egui::Key::R))
+                // Shift+R is Reference View, below.
+                if (i.key_pressed(egui::Key::C)
+                    || i.key_pressed(egui::Key::R) && !i.modifiers.shift)
                     && !i.modifiers.command
                 {
                     self.view.toggle(Tool::Crop);
+                }
+                if i.key_pressed(egui::Key::R)
+                    && i.modifiers.shift
+                    && !i.modifiers.command
+                    && !i.modifiers.alt
+                {
+                    self.toggle_reference_view();
+                }
+                // Lightroom's I: the photo info overlay, Info 1, Info 2 or off.
+                // Once per press: a held I must not flicker through them. With the
+                // modifiers held for it, which a quick shortcut can release in the
+                // same frame.
+                let info = i.events.iter().any(|event| {
+                    matches!(event, egui::Event::Key { key: egui::Key::I, pressed: true, repeat: false, modifiers, .. } if !modifiers.any())
+                });
+                if info && let Some(library) = &mut self.library {
+                    library.cycle_loupe_info();
                 }
                 // Shift+J makes a colour range mask, below.
                 if i.key_pressed(egui::Key::J) && !i.modifiers.any() {
                     self.view.clipping.toggle_both();
                 }
                 if i.key_pressed(egui::Key::Backslash) {
-                    self.view.compare = !self.view.compare;
+                    let view = self.view.compare.toggled(super::before_after::Compare::BeforeOnly);
+                    self.set_compare(view);
                 }
                 if i.key_pressed(egui::Key::Enter)
                     && (self.view.is(Tool::Crop) || self.view.is(Tool::Guided))
@@ -821,6 +896,9 @@ impl Editor {
             if reset {
                 self.reset_settings();
             }
+            if let Some(target) = targeted {
+                self.toggle_targeted(target);
+            }
             if auto && !self.auto_in_effect() {
                 self.start_auto(super::worker::AutoKind::Settings);
             }
@@ -837,6 +915,9 @@ impl Editor {
             }
             if previous {
                 self.paste_previous();
+            }
+            if let Some(transfer) = transfer {
+                self.transfer(transfer);
             }
         }
     }
@@ -923,6 +1004,10 @@ impl Editor {
             {
                 return;
             }
+            if let Some(crate::app::library::Pick::Reference(id)) = strip.pick {
+                self.set_reference(id);
+                return;
+            }
             if let Some(
                 crate::app::library::Pick::Show(id) | crate::app::library::Pick::Develop(id),
             ) = strip.pick
@@ -940,6 +1025,10 @@ impl Editor {
             .min_size(180.)
             .max_size(400.)
             .show(ui, |ui| {
+                let _side = super::widgets::SectionSide::enter(
+                    ui,
+                    super::widgets::SectionGroup::DevelopLeft,
+                );
                 self.navigator_ui(ui);
                 self.presets_ui(ui);
             });
@@ -950,10 +1039,14 @@ impl Editor {
             .min_size(300.)
             .max_size(400.)
             .show(ui, |ui| {
+                let _side = super::widgets::SectionSide::enter(
+                    ui,
+                    super::widgets::SectionGroup::DevelopRight,
+                );
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.add_enabled_ui(self.document.full().is_some() && !self.view.compare, |ui| {
-                        self.controls(ui)
-                    });
+                    let enabled =
+                        self.document.full().is_some() && !self.view.compare.before_only();
+                    ui.add_enabled_ui(enabled, |ui| self.controls(ui));
                 });
             });
         egui::CentralPanel::default().show(ui, |ui| self.viewport_ui(ui));

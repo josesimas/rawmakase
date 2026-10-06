@@ -16,11 +16,17 @@ impl Editor {
         area: Rect,
     ) -> bool {
         // Holding Space pans instead, as in Lightroom.
-        if ui.input(|i| i.key_down(egui::Key::Space)) || self.view.compare {
+        if ui.input(|i| i.key_down(egui::Key::Space)) || self.view.compare.shows_before() {
+            // A targeted drag the hand or Before takes over ends where it is.
+            if self.view.targeted.is_some() && !ui.input(|i| i.pointer.primary_down()) {
+                self.end_targeted_drag();
+            }
             return false;
         }
         match self.view.tool {
-            Tool::None | Tool::Crop | Tool::WhiteBalance | Tool::Defringe => false,
+            Tool::None | Tool::Crop | Tool::WhiteBalance | Tool::Defringe | Tool::PointColor => {
+                false
+            }
             Tool::Remove => {
                 self.retouch_overlay(ui, response, rect);
                 true
@@ -32,6 +38,10 @@ impl Editor {
             Tool::Mask => self.mask_overlay(ui, response, rect),
             Tool::Guided => {
                 self.guided_overlay(ui, response, rect, area);
+                true
+            }
+            Tool::Targeted(target) => {
+                self.targeted_overlay(ui, response, rect, target);
                 true
             }
         }
@@ -80,6 +90,29 @@ pub(super) fn brush_cursor(painter: &Painter, at: Pos2, radius: f32, feather: f3
         ellipse(painter, at, Vec2::splat(radius * (1. - feather)), 0., 0.7);
     }
     painter.circle_filled(at, 1.5, Color32::WHITE);
+}
+/// A brush stroke along `points` (screen space) as Lightroom draws one: the outline of
+/// everything within `radius` of the path, round at its ends and corners.
+pub(super) fn stroke_outline(painter: &Painter, points: &[Pos2], radius: f32, width: f32) {
+    let edges = super::stroke_outline::outline(points, radius, 2.);
+    // A brush too thin to outline shows as its path.
+    if edges.is_empty() {
+        match points {
+            [] => {}
+            [dot] => ellipse(painter, *dot, Vec2::splat(radius.max(1.5)), 0., width),
+            _ => path(painter, points.to_vec(), Color32::from_white_alpha(230)),
+        }
+        return;
+    }
+    for [a, b] in &edges {
+        painter.line_segment(
+            [*a, *b],
+            Stroke::new(width + 1.5, Color32::from_black_alpha(110)),
+        );
+    }
+    for [a, b] in edges {
+        painter.line_segment([a, b], Stroke::new(width, Color32::from_white_alpha(230)));
+    }
 }
 /// A path drawn as a thin outlined line.
 pub(super) fn path(painter: &Painter, points: Vec<Pos2>, color: Color32) {

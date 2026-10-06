@@ -4,7 +4,9 @@
 //! shown pixels for the white balance loupe come back.
 use super::{Processor, develop::Input};
 use crate::develop::{
-    ClipOverlay, Histogram, Recipe, effects::PostCropVignette, pipeline::pixel_params::PixelParams,
+    ClipOverlay, Histogram, Recipe,
+    effects::{GrainField, GrainModel, PostCropVignette},
+    pipeline::pixel_params::PixelParams,
     quality,
 };
 use anyhow::{Context, Result, ensure};
@@ -31,6 +33,10 @@ pub enum Slot {
     Whole,
     /// A 100% region and its reduced preview.
     Region,
+    /// Before's whole photo and region beside the edit, in Before/After views: kept
+    /// apart so neither side is presented into a texture the other still shows.
+    BeforeWhole,
+    BeforeRegion,
 }
 /// How a preview is shown.
 pub struct Display {
@@ -389,6 +395,7 @@ impl Processor {
             }));
         }
         let sharpen = recipe.sharpening != 0.;
+        let sharpener = crate::develop::sharpening::Sharpener::new(recipe);
         let (radius, weights) = if sharpen {
             quality::gaussian(finish.sigma)
         } else {
@@ -418,12 +425,18 @@ impl Processor {
             None => None,
         };
         let e = &recipe.effects;
-        let effects = e.grain != 0. || e.vignette != 0. || e.lens_vignette != 0.;
+        let lens_vignette = recipe.finished_lens_vignette();
+        let effects = e.grain != 0. || e.vignette != 0. || lens_vignette != 0.;
         let [cx, cy, cw, ch] = finish.crop;
         let f = f32::to_bits;
         let vignette = PostCropVignette::new(e, finish.full);
+        let grain = GrainField::new(
+            e,
+            recipe.grain_model,
+            finish.full[0].max(finish.full[1]) as f32 / finish.scale,
+        );
         let parameters = |shown: bool| -> wgpu::Buffer {
-            let values: [u32; 36] = [
+            let values: [u32; 40] = [
                 width,
                 height,
                 cx,
@@ -432,8 +445,8 @@ impl Processor {
                 ch,
                 radius as u32,
                 sharpen as u32,
-                f(recipe.sharpening),
-                f(recipe.sharpening_masking * 0.03 * (1. - recipe.sharpening_detail * 0.8)),
+                f(recipe.sharpening * sharpener.gain),
+                f(sharpener.threshold),
                 if shown {
                     display.clipping.shader_flags()
                 } else {
@@ -449,10 +462,10 @@ impl Processor {
                 finish.full[0],
                 finish.full[1],
                 f(finish.scale),
-                f(e.grain),
-                f(e.grain_size),
-                f(e.grain_roughness),
-                e.grain_seed,
+                f(grain.amount),
+                f(grain.cell),
+                f(grain.coarse),
+                grain.seed,
                 f(vignette.map_or(0., |v| v.amount)),
                 vignette.map_or(0, |v| v.style.code() as u32),
                 f(vignette.map_or(0., |v| v.highlights)),
@@ -461,11 +474,15 @@ impl Processor {
                 f(vignette.map_or(2., |v| v.power)),
                 f(vignette.map_or(0., |v| v.midpoint)),
                 f(vignette.map_or(1., |v| v.feather)),
-                f(e.lens_vignette),
+                f(lens_vignette),
                 f(e.lens_vignette_midpoint),
                 effects as u32,
                 shown as u32,
+                f(sharpener.halo),
+                f(sharpener.dark),
                 0,
+                f(grain.fine),
+                (grain.model == GrainModel::Measured) as u32,
                 0,
                 0,
             ];

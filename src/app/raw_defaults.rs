@@ -41,7 +41,7 @@ impl Editor {
         let resolved = self.raw_defaults.resolve(m, &self.document.profiles);
         let before_changed =
             self.document.defaults.as_ref().map(|d| &d.recipe) != Some(&resolved.recipe);
-        let mut changed = before_changed && self.view.compare;
+        let mut changed = before_changed && self.view.compare.shows_before();
         if self.follows_defaults() {
             if let Some(note) = &resolved.note {
                 self.status = note.clone();
@@ -100,6 +100,8 @@ impl Editor {
         if let Some(library) = &mut self.library {
             library.set_defaults(self.raw_defaults.clone());
         }
+        // An unedited reference photo follows them too, profiles imported included.
+        self.reload_reference();
     }
     /// Lists the cameras to choose from, when Preferences opens.
     pub(super) fn measure_raw_defaults(&mut self) {
@@ -276,14 +278,18 @@ fn remove_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
     );
     response.on_hover_text("Remove this camera's default")
 }
-/// Adobe Default, RAWmakase Default or a Develop preset, by group.
+/// Adobe Default, Camera Settings, RAWmakase Default or a Develop preset, by group.
 fn choice_combo(ui: &mut egui::Ui, id: &str, choice: &mut DefaultChoice, presets: &[Preset]) {
     egui::ComboBox::from_id_salt(id)
         .width(240.)
         .height(360.)
         .selected_text(choice_text(choice, presets))
         .show_ui(ui, |ui| {
-            for fixed in [DefaultChoice::Adobe, DefaultChoice::Rawmakase] {
+            for fixed in [
+                DefaultChoice::Adobe,
+                DefaultChoice::CameraSettings,
+                DefaultChoice::Rawmakase,
+            ] {
                 let label = fixed.label();
                 ui.selectable_value(choice, fixed, label);
             }
@@ -554,7 +560,7 @@ mod tests {
         editor.document.metadata = Some(m.clone());
         editor.document.origin = EditOrigin::Saved;
         editor.refresh_photo_defaults();
-        editor.view.compare = true;
+        editor.view.compare = crate::app::before_after::Compare::BeforeOnly;
         editor.set_raw_defaults(lighten()).unwrap();
         let lightened = editor.raw_defaults.resolve(&m, &profiles(&m)).recipe;
         assert_eq!(editor.effective_recipe().curve, lightened.curve);

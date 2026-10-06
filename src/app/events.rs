@@ -1,7 +1,7 @@
 //! Accept worker results at a single generation-checked boundary.
 use super::{
     Editor,
-    worker::{self, Event, LoadedHeader, RenderStage, TaskKind},
+    worker::{self, Event, LoadedHeader, Pane, RenderStage, TaskKind},
 };
 use crate::export::ExportOptions;
 use eframe::egui;
@@ -9,6 +9,11 @@ use eframe::egui;
 impl Editor {
     pub(super) fn events(&mut self, ctx: &egui::Context) {
         self.import_progress(ctx);
+        // A Point Color sample stops as soon as its tab is no longer where the photo is
+        // edited (the Library, Before, another tab), whichever way that happened.
+        if self.document.point_color_pick.is_running() && !self.point_color_tab_shown() {
+            self.document.point_color_pick.invalidate();
+        }
         while let Ok(event) = self.rx.try_recv() {
             match event {
                 Event::CatalogWorking(message) => {
@@ -42,6 +47,28 @@ impl Editor {
                 Event::Auto { id, kind, result } if id == self.load.id() => {
                     self.auto_ready(kind, result)
                 }
+                Event::PointColorSample {
+                    id,
+                    generation,
+                    sampled,
+                    result,
+                } if id == self.load.id()
+                    && self.document.point_color_pick.is_running()
+                    && self.document.point_color_pick.id() == generation =>
+                {
+                    self.point_color_sample_ready(&sampled, result)
+                }
+                Event::TargetedSample {
+                    id,
+                    generation,
+                    sampled,
+                    result,
+                } if id == self.load.id()
+                    && self.document.targeted_pick.is_running()
+                    && self.document.targeted_pick.id() == generation =>
+                {
+                    self.targeted_sample_ready(&sampled, result)
+                }
                 Event::Upright {
                     id,
                     generation,
@@ -66,8 +93,8 @@ impl Editor {
                     self.document.profile_errors = errors;
                     self.refresh_photo_defaults();
                     self.refresh_preset_support();
-                    if std::mem::take(&mut self.document.pending_lightroom) {
-                        self.apply_lightroom_edits();
+                    if let Some(text) = self.document.pending_lightroom.take() {
+                        self.apply_lightroom_edits(&text);
                         // The Lightroom edit is the starting point, not an unsaved change.
                         self.document.save.saved();
                     }
@@ -130,8 +157,19 @@ impl Editor {
                     }
                     self.schedule();
                 }
+                Event::Reference { ticket, result } => self.reference_ready(ticket, result),
                 Event::Rendered {
                     id,
+                    pane: Pane::Before,
+                    preview,
+                    stage,
+                    ..
+                } if id == self.preview.before.task.id() => {
+                    self.before_rendered(ctx, preview, stage, id);
+                }
+                Event::Rendered {
+                    id,
+                    pane: Pane::After,
                     preview,
                     histogram,
                     thumbnail,
@@ -166,6 +204,9 @@ impl Editor {
                             navigator,
                         } => self.set_presented(region, (id, size), navigator),
                     }
+                    // Pixels asked for by a hover or loupe that has since ended are
+                    // not kept.
+                    let samples = samples.filter(|_| self.preview.samples_requested);
                     if region {
                         self.preview.region_samples = samples;
                     } else {
@@ -197,11 +238,31 @@ impl Editor {
                 }
                 Event::Failed {
                     id,
-                    task: TaskKind::Render,
+                    task: TaskKind::Render(Pane::After),
                     error,
                 } if id == self.preview.task.id() => {
                     self.status = error;
                     self.preview.task.finish(id);
+                    // A failed render on the GPU retires Before's textures too: render
+                    // Before again, not the edit that failed.
+                    let before = &mut self.preview.before;
+                    if before.texture.is_none() && before.region.is_none() {
+                        before.forget_job();
+                        self.schedule_before();
+                    }
+                }
+                Event::Failed {
+                    id,
+                    task: TaskKind::Render(Pane::Before),
+                    error,
+                } if id == self.preview.before.task.id() => {
+                    self.status = format!("Before: {error}");
+                    self.preview.before.task.finish(id);
+                    // A failed render on the GPU retires the edit's textures too: render
+                    // the edit again. Before keeps its failed job, so it is not retried.
+                    if self.preview.texture.is_none() && self.preview.region.is_none() {
+                        self.schedule();
+                    }
                 }
                 Event::RendererReset(retired) => {
                     self.preview.forget_presented();
@@ -243,6 +304,8 @@ impl Editor {
                     .is_some_and(|old| old.catalog.path == l.catalog.path);
                 if !reloaded {
                     self.undo_log.clear();
+                    // Photo ids belong to their catalog, and so does the reference.
+                    self.clear_reference();
                 }
                 l.set_defaults(self.raw_defaults.clone());
                 if self.session_file.is_some() {
@@ -300,7 +363,14 @@ impl Editor {
             self.document.lightroom_history =
                 l.catalog.lightroom_history(photo).unwrap_or_default();
             self.document.snapshots.list = l.catalog.snapshots(photo).unwrap_or_default();
-            match l.catalog.load_edit(photo, &p) {
+            // The edit as the catalog stores it, read once: the Lightroom settings
+            // applied below are the ones read with it.
+            let record = l.catalog.edit_record(photo);
+            let saved = record
+                .as_ref()
+                .map_err(|e| anyhow::anyhow!("{e:#}"))
+                .and_then(|r| r.saved(&p));
+            match saved {
                 Ok(Some(saved)) => {
                     self.document.origin = super::state::EditOrigin::Saved;
                     self.document.recipe = saved.recipe;
@@ -320,8 +390,8 @@ impl Editor {
                     // No RAWmakase edit yet: start from the Lightroom edit, as
                     // Lightroom shows it, once camera profiles are known.
                     self.document.pending_lightroom =
-                        l.photo(photo).is_some_and(|p| p.has_lightroom_edits);
-                    if self.document.pending_lightroom {
+                        record.ok().and_then(|r| r.lightroom().map(str::to_owned));
+                    if self.document.pending_lightroom.is_some() {
                         self.document.origin = super::state::EditOrigin::Lightroom;
                     }
                 }
@@ -346,7 +416,7 @@ impl Editor {
             && self.document.catalog_photo.is_some()
             && self.document.path.is_some()
             && !self.view.zoom.on
-            && !self.view.compare
+            && !self.view.compare.shows_before()
             && !self.view.is(super::state::Tool::Crop)
             && self.presets.preview.is_none()
     }

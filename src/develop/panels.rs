@@ -72,6 +72,23 @@ impl Panel {
             ],
         }
     }
+    /// Whether `after` differs from `before` only in this panel's settings, as an
+    /// edit in the panel leaves it.
+    pub fn holds_change(self, before: &Recipe, after: &Recipe) -> bool {
+        if before == after {
+            return false;
+        }
+        let defaults = Recipe::default();
+        let (mut a, mut b) = (before.clone(), after.clone());
+        self.bypass(&mut a, &defaults);
+        self.bypass(&mut b, &defaults);
+        // The camera's built-in correction stays through the bypass, but Enable
+        // Profile Corrections sets it with the profile, so it is the panel's too.
+        if self == Panel::LensCorrections {
+            a.lens_builtin = b.lens_builtin;
+        }
+        a == b
+    }
     /// Sets this panel's settings in `r` to the values of `defaults`.
     fn bypass(self, r: &mut Recipe, defaults: &Recipe) {
         let (e, d) = (&mut r.effects, &defaults.effects);
@@ -99,6 +116,8 @@ impl Panel {
                 r.sharpening_radius = defaults.sharpening_radius;
                 r.sharpening_detail = defaults.sharpening_detail;
                 r.sharpening_masking = defaults.sharpening_masking;
+                // Renders nothing at Amount 0; Detail's reset sets the measured one.
+                r.sharpening_model = defaults.sharpening_model;
                 r.noise_luma = 0.;
                 r.noise_chroma = 0.;
                 e.luma_detail = d.luma_detail;
@@ -110,6 +129,7 @@ impl Panel {
             // outside the panel's controls (inferred; not yet measured).
             Panel::LensCorrections => {
                 r.lens_profile = false;
+                r.lens_profile_choice = defaults.lens_profile_choice.clone();
                 r.lens_ca = false;
                 r.lens_distortion = defaults.lens_distortion;
                 r.lens_vignetting = defaults.lens_vignetting;
@@ -118,18 +138,28 @@ impl Panel {
                 e.defringe_ranges = d.defringe_ranges;
                 e.lens_vignette = 0.;
                 e.lens_vignette_midpoint = d.lens_vignette_midpoint;
+                // Renders nothing at Amount 0; a first Vignetting edit sets it.
+                r.lens_vignette_model = defaults.lens_vignette_model;
             }
             Panel::Transform => {
                 r.transform = defaults.transform;
                 r.upright = defaults.upright.clone();
                 r.constrain_crop = defaults.constrain_crop;
             }
-            Panel::Effects => e.reset_post_crop(),
+            Panel::Effects => {
+                e.reset_post_crop();
+                // Renders nothing at Amount 0; a first Grain edit sets it.
+                r.grain_model = defaults.grain_model;
+            }
             Panel::Calibration => {
                 e.calibration = d.calibration;
                 e.shadow_tint = d.shadow_tint;
             }
-            Panel::SpotRemoval => r.retouch.clear(),
+            Panel::SpotRemoval => {
+                r.retouch.clear();
+                // Renders nothing without spots; the first spot sets it.
+                r.retouch_model = defaults.retouch_model;
+            }
             Panel::RedEye => r.red_eye.clear(),
             Panel::Masks => r.masks.clear(),
         }
@@ -180,5 +210,55 @@ impl Recipe {
         // The switches stay, so `Recipe::resolved`, which knows the camera, can also
         // turn off lens data that is only on because of the panel.
         std::borrow::Cow::Owned(r)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_change_inside_one_panel_is_held_by_that_panel_alone() {
+        let before = Recipe::default();
+        let mut after = before.clone();
+        after.effects.gray_mix[0] = 0.3;
+        assert!(Panel::BlackWhiteMix.holds_change(&before, &after));
+        assert!(!Panel::Detail.holds_change(&before, &after));
+        after.exposure = 0.5;
+        assert!(!Panel::BlackWhiteMix.holds_change(&before, &after));
+        // Enable Profile Corrections sets the camera's built-in correction with it.
+        let mut after = before.clone();
+        after.lens_profile = !before.lens_profile;
+        after.lens_builtin = !before.lens_builtin;
+        assert!(Panel::LensCorrections.holds_change(&before, &after));
+        // A first manual Vignetting on an old recipe also sets the measured operator.
+        let mut after = before.clone();
+        after.effects.lens_vignette = -0.4;
+        after.adopt_measured_vignette(0.);
+        assert!(Panel::LensCorrections.holds_change(&before, &after));
+        // A first Grain on an old recipe also sets the measured grain.
+        let mut after = before.clone();
+        after.effects.grain = 0.4;
+        after.adopt_measured_grain(0.);
+        assert!(Panel::Effects.holds_change(&before, &after));
+        // A first spot also sets the measured feather.
+        let mut after = before.clone();
+        after.add_retouch(crate::develop::retouch::RetouchOp {
+            mode: crate::develop::retouch::RetouchMode::Clone,
+            shape: crate::develop::retouch::RetouchShape::Spot {
+                center: [0.3, 0.3],
+                radius: 0.05,
+            },
+            feather: 0.5,
+            opacity: 1.,
+            offset: [0.2, 0.],
+        });
+        assert!(Panel::SpotRemoval.holds_change(&before, &after));
+        // Detail's reset on an old recipe also sets the measured sharpening.
+        let mut before = before.clone();
+        before.sharpening = 0.35;
+        let mut after = before.clone();
+        after.set_sharpening_defaults(crate::develop::sharpening::SharpeningModel::Measured);
+        assert!(Panel::Detail.holds_change(&before, &after));
     }
 }

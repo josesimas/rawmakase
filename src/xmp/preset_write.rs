@@ -7,6 +7,7 @@ use super::{
 };
 use crate::develop::{
     Recipe,
+    curve::ToneCurve,
     settings_groups::{GroupInclusion, GroupSelection, SettingGroup},
 };
 use std::fmt::Write;
@@ -53,11 +54,18 @@ pub fn preset(r: &Recipe, info: &PresetInfo, groups: &GroupSelection) -> String 
     let mut groups = groups.clone();
     groups.set(SettingGroup::UprightTransforms, GroupInclusion::Excluded);
     let groups = &groups;
+    // Lightroom's Amount slider, offered when every setting written scales with it.
+    // Spots and masks are never written.
+    let supports_amount = groups
+        .groups()
+        .filter(|g| !matches!(g, SettingGroup::SpotRemoval | SettingGroup::Masking))
+        .all(crate::presets::amount::group_scales);
+    let supports_amount = if supports_amount { "True" } else { "False" };
     let mut attributes: Vec<(String, String)> = [
         ("PresetType", "Normal"),
         ("Cluster", ""),
         ("UUID", info.uuid.as_str()),
-        ("SupportsAmount", "False"),
+        ("SupportsAmount", supports_amount),
         ("SupportsColor", "True"),
         ("SupportsMonochrome", "True"),
         ("SupportsHighDynamicRange", "True"),
@@ -106,6 +114,16 @@ pub fn preset(r: &Recipe, info: &PresetInfo, groups: &GroupSelection) -> String 
         .filter(|(key, _)| !attributes.iter().any(|(k, _)| k == key))
         .collect();
     attributes.extend(dormant);
+    // Operators of the chosen groups that the photo keeps from before they were
+    // measured, so applying the preset renders them as the photo does.
+    let original: Vec<_> = super::write::original_operators(r)
+        .into_iter()
+        .filter(|(_, key)| group_of_key(key).is_some_and(|g| groups.contains(g)))
+        .map(|(name, _)| name)
+        .collect();
+    if !original.is_empty() {
+        attributes.push(("RAWmakaseOriginal".into(), original.join(",")));
+    }
     // Each chosen panel's switch as the photo has it, on or off, so applying the
     // preset also sets that panel the same way.
     for panel in crate::develop::panels::Panel::ALL {
@@ -153,6 +171,20 @@ pub fn preset(r: &Recipe, info: &PresetInfo, groups: &GroupSelection) -> String 
     }
     if groups.contains(SettingGroup::ColorAdjustments) {
         super::write::point_colors(&mut out, r, super::write::NoPointColors::EmptySelection);
+    }
+    out.push_str("  </rdf:Description>\n");
+    xmpmeta(&out)
+}
+
+/// A saved point curve as Lightroom and Camera Raw keep one in their Curves folder:
+/// the RGB curve and the Red, Green and Blue curves, named by the file.
+pub fn point_curve(rgb: &ToneCurve, channels: &[ToneCurve; 3]) -> String {
+    let mut out = format!(
+        "  <rdf:Description rdf:about=\"\"\n    xmlns:crs=\"{CRS}\"\n   crs:Version=\"15.4\"\n   crs:ProcessVersion=\"11.0\"\n   crs:ToneCurveName2012=\"Custom\"\n   crs:HasSettings=\"True\">\n"
+    );
+    curve(&mut out, "ToneCurvePV2012", rgb);
+    for (channel, name) in channels.iter().zip(["Red", "Green", "Blue"]) {
+        curve(&mut out, &format!("ToneCurvePV2012{name}"), channel);
     }
     out.push_str("  </rdf:Description>\n");
     xmpmeta(&out)
@@ -298,6 +330,97 @@ mod tests {
         )?;
         assert_eq!(back.profile.as_ref().unwrap().name, "Test Creative");
         assert_eq!(back.profile_amount, 0.35);
+        Ok(())
+    }
+    /// A preset offers Lightroom's Amount only when every setting it holds scales.
+    #[test]
+    fn presets_offer_an_amount_when_every_group_scales() -> anyhow::Result<()> {
+        let info = PresetInfo::new("Soft", "User Presets");
+        let mut tones = GroupSelection::none();
+        for group in [
+            SettingGroup::Exposure,
+            SettingGroup::ToneCurve,
+            SettingGroup::WhiteBalance,
+            SettingGroup::TreatmentAndProfile,
+            // Never written, so they don't count.
+            SettingGroup::SpotRemoval,
+            SettingGroup::Masking,
+        ] {
+            tones.set(group, GroupInclusion::Included);
+        }
+        let text = preset(&edited(), &info, &tones);
+        assert!(text.contains(r#"crs:SupportsAmount="True""#), "{text}");
+        let parsed = crate::xmp::parse(Path::new("Soft.xmp"), &text)?;
+        let m = crate::raw::Metadata {
+            wb: [2., 1., 1.8],
+            daylight_wb: [2., 1., 1.8],
+            matrix: [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]],
+            ..Default::default()
+        };
+        let before = Recipe::default();
+        let full = parsed.apply(&before, &m, &[], None)?;
+        let amount = crate::presets::amount::PresetAmount::new(&parsed, before, full)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert_eq!(amount.at(0.5, &m).exposure, 0.25);
+        // Crop or lens corrections don't scale.
+        for group in [SettingGroup::Crop, SettingGroup::LensProfileCorrections] {
+            let mut with = tones.clone();
+            with.set(group, GroupInclusion::Included);
+            let text = preset(&edited(), &info, &with);
+            assert!(text.contains(r#"crs:SupportsAmount="False""#), "{group:?}");
+        }
+        Ok(())
+    }
+    /// A preset made from a photo that keeps the original sharpening renders it the
+    /// same way where it's applied; without the Sharpening group it says nothing of it.
+    #[test]
+    fn presets_carry_the_original_sharpening_of_their_photo() -> anyhow::Result<()> {
+        use crate::develop::sharpening::SharpeningModel;
+        let info = PresetInfo::new("Crisp", "User Presets");
+        let source = Recipe {
+            sharpening: 0.5,
+            ..Default::default()
+        };
+        assert_eq!(source.sharpening_model, SharpeningModel::Original);
+        let m = crate::raw::Metadata {
+            wb: [2., 1., 1.8],
+            daylight_wb: [2., 1., 1.8],
+            matrix: [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]],
+            ..Default::default()
+        };
+        let target = Recipe::with_profiles(&m, &[]);
+        assert_eq!(target.sharpening_model, SharpeningModel::Measured);
+        let mut sharpening = GroupSelection::none();
+        sharpening.set(SettingGroup::Sharpening, GroupInclusion::Included);
+        let text = preset(&source, &info, &sharpening);
+        let applied =
+            crate::xmp::parse(Path::new("Crisp.xmp"), &text)?.apply(&target, &m, &[], None)?;
+        assert_eq!(applied.sharpening_model, SharpeningModel::Original);
+        let mut exposure = GroupSelection::none();
+        exposure.set(SettingGroup::Exposure, GroupInclusion::Included);
+        assert!(!preset(&source, &info, &exposure).contains("RAWmakaseOriginal"));
+        Ok(())
+    }
+    #[test]
+    fn process_version_presets_carry_the_original_mixer_and_calibration() -> anyhow::Result<()> {
+        use crate::develop::{calibration::CalibrationModel, color_mixer::MixerModel};
+        let info = PresetInfo::new("Old process", "User Presets");
+        let source = Recipe::default();
+        let m = crate::raw::Metadata {
+            wb: [2., 1., 1.8],
+            daylight_wb: [2., 1., 1.8],
+            matrix: [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]],
+            ..Default::default()
+        };
+        let target = Recipe::with_profiles(&m, &[]);
+        assert_eq!(target.calibration_model, CalibrationModel::Measured);
+        let mut process = GroupSelection::none();
+        process.set(SettingGroup::ProcessVersion, GroupInclusion::Included);
+        let text = preset(&source, &info, &process);
+        let applied =
+            crate::xmp::parse(Path::new("Old.xmp"), &text)?.apply(&target, &m, &[], None)?;
+        assert_eq!(applied.mixer_model, MixerModel::Original);
+        assert_eq!(applied.calibration_model, CalibrationModel::Original);
         Ok(())
     }
     #[test]

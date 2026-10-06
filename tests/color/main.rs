@@ -10,8 +10,10 @@
 //! against their last accepted renders.
 //!
 //! RAWMAKASE_BLESS=1 rewrites charts, snapshots and baselines instead of comparing.
+mod black_render;
 mod chart;
 mod dng;
+mod fit_chart;
 mod measure;
 mod private;
 mod red_eye;
@@ -101,6 +103,7 @@ pub fn generate(spec: &ChartSpec, layout: &Layout) -> Vec<u8> {
             camera: &rendered.camera,
             as_shot_neutral: rendered.as_shot_neutral,
             profile: spec.profile,
+            black_render: dng::BlackRender::Auto,
         },
         &spec.camera,
     )
@@ -769,6 +772,17 @@ pub fn check_parity(
             profiles,
             Some(&reference.cases),
         );
+        // RAWmakase's patch values for scripts/corpus/parity-report.py.
+        if let Some(dir) = std::env::var_os("RAWMAKASE_PARITY_DUMP") {
+            PatchFile {
+                about: BTreeMap::new(),
+                cases: current
+                    .iter()
+                    .filter_map(|(name, v)| Some((name.clone(), v.as_ref().ok()?.clone())))
+                    .collect(),
+            }
+            .write(&Path::new(&dir).join(format!("{chart}.json")));
+        }
         println!(
             "\n{title}: {chart} (Camera Raw {})",
             reference.about.get("camera_raw").map_or("?", |s| s)

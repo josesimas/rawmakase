@@ -102,7 +102,8 @@ pub fn blocks(width: u32, height: u32) -> Vec<Patch> {
 }
 
 const RAW_EXTENSIONS: &[&str] = &[
-    "arw", "raf", "nef", "nrw", "cr2", "cr3", "dng", "rw2", "orf",
+    "arw", "raf", "nef", "nrw", "cr2", "cr3", "dng", "rw2", "orf", "ori", "pef", "rwl", "fff",
+    "3fr",
 ];
 const PHOTO_EDGE: u32 = 1200;
 
@@ -330,6 +331,14 @@ fn photos_camera_raw_parity_does_not_regress() {
                             );
                             if ours.len() != r.blocks.len() {
                                 return Err("block grid differs".into());
+                            }
+                            // RAWmakase's blocks for scripts/corpus/parity-report.py.
+                            if let Some(dir) = std::env::var_os("RAWMAKASE_PARITY_DUMP") {
+                                let path =
+                                    Path::new(&dir).join("photos").join(format!("{name}.json"));
+                                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                                std::fs::write(path, serde_json::to_string(&ours).unwrap())
+                                    .unwrap();
                             }
                             Ok(compare(&r.blocks, &ours, |_| true))
                         });

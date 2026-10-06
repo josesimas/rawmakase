@@ -1,5 +1,6 @@
 use crate::app::icons::{self, Icon};
 use crate::app::theme;
+use crate::develop::panels::PanelState;
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 
 pub(super) fn toolbar_divider(ui: &mut egui::Ui) {
@@ -91,8 +92,11 @@ pub(super) fn history_step_id() -> egui::Id {
     egui::Id::new("rawmakase-history-step")
 }
 pub(super) fn name_history_step(ui: &egui::Ui, name: String, value: String) {
-    ui.ctx()
-        .data_mut(|d| d.insert_temp(history_step_id(), (name, value)));
+    name_frame_step(ui.ctx(), name, value);
+}
+/// As [`name_history_step`], for an edit made outside a control during the frame.
+pub(super) fn name_frame_step(ctx: &egui::Context, name: String, value: String) {
+    ctx.data_mut(|d| d.insert_temp(history_step_id(), (name, value)));
 }
 /// The panel or sub-panel being drawn ("Detail", then "Sharpening"), so a
 /// slider's step reads "Sharpening Amount" rather than "Amount".
@@ -135,11 +139,153 @@ pub(super) fn section_with(
     button: HeaderButton,
     contents: impl FnOnce(&mut egui::Ui),
 ) -> bool {
+    section_header(ui, title, button, None, contents)
+}
+/// A resettable Develop panel with Lightroom's on/off switch in its header, over
+/// the photo's `Enable*` setting; returns whether reset was clicked.
+pub(super) fn switched_section(
+    ui: &mut egui::Ui,
+    title: &str,
+    switch: &mut PanelState,
+    contents: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    section_header(ui, title, HeaderButton::Reset, Some(switch), contents)
+}
+/// The side of the window a panel is in. Solo Mode is per side, as in Lightroom.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SectionGroup {
+    DevelopLeft,
+    DevelopRight,
+    LibraryLeft,
+    LibraryRight,
+}
+impl SectionGroup {
+    /// A stable name, as saved in the session.
+    pub(super) fn key(self) -> &'static str {
+        match self {
+            SectionGroup::DevelopLeft => "develop-left",
+            SectionGroup::DevelopRight => "develop-right",
+            SectionGroup::LibraryLeft => "library-left",
+            SectionGroup::LibraryRight => "library-right",
+        }
+    }
+}
+/// Where the sides in Solo Mode live in egui memory, by [`SectionGroup::key`]; the
+/// editor seeds it from the session and saves it back when it changes.
+pub(super) fn solo_sections_id() -> egui::Id {
+    egui::Id::new("rawmakase-solo-sections")
+}
+fn section_group_id() -> egui::Id {
+    egui::Id::new("rawmakase-section-group")
+}
+/// Every section title drawn so far on each side, so Solo Mode can close the others.
+fn section_titles_id() -> egui::Id {
+    egui::Id::new("rawmakase-section-titles")
+}
+type SectionTitles = std::collections::BTreeMap<String, std::collections::BTreeSet<String>>;
+/// While alive, the sections drawn belong to one side of the window.
+pub(super) struct SectionSide {
+    ctx: egui::Context,
+}
+impl SectionSide {
+    pub(super) fn enter(ui: &egui::Ui, group: SectionGroup) -> Self {
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(section_group_id(), Some(group.key())));
+        Self {
+            ctx: ui.ctx().clone(),
+        }
+    }
+}
+impl Drop for SectionSide {
+    fn drop(&mut self) {
+        self.ctx
+            .data_mut(|d| d.insert_temp::<Option<&'static str>>(section_group_id(), None));
+    }
+}
+fn current_group(ui: &egui::Ui) -> Option<&'static str> {
+    ui.ctx()
+        .data(|d| d.get_temp::<Option<&'static str>>(section_group_id()))
+        .flatten()
+}
+fn solo(ui: &egui::Ui, group: &str) -> bool {
+    ui.ctx().data(|d| {
+        d.get_temp::<std::collections::BTreeSet<String>>(solo_sections_id())
+            .is_some_and(|set| set.contains(group))
+    })
+}
+fn set_open(ui: &egui::Ui, title: &str, open: bool) {
+    ui.ctx().data_mut(|d| {
+        let set = d
+            .get_temp_mut_or_default::<std::collections::BTreeSet<String>>(collapsed_sections_id());
+        if open {
+            set.remove(title);
+        } else {
+            set.insert(title.to_string());
+        }
+    });
+}
+/// Closes every other section on `group`'s side, as opening one in Solo Mode does.
+fn close_others(ui: &egui::Ui, group: &str, title: &str) {
+    let others: Vec<String> = ui.ctx().data(|d| {
+        d.get_temp::<SectionTitles>(section_titles_id())
+            .and_then(|titles| titles.get(group).cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|other| other != title)
+            .collect()
+    });
+    for other in others {
+        set_open(ui, &other, false);
+    }
+}
+/// Turns Solo Mode on or off for `group`; turning it on leaves only `title` open,
+/// if it is.
+fn toggle_solo(ui: &egui::Ui, group: &str, title: &str) {
+    let on = !solo(ui, group);
+    ui.ctx().data_mut(|d| {
+        let set =
+            d.get_temp_mut_or_default::<std::collections::BTreeSet<String>>(solo_sections_id());
+        if on {
+            set.insert(group.to_string());
+        } else {
+            set.remove(group);
+        }
+    });
+    if on {
+        close_others(ui, group, title);
+    }
+}
+/// The name a section's open state and Solo Mode go by. B&W replaces the Color
+/// Mixer in the same place when a photo is black and white, as in Lightroom, so
+/// they open and close as one panel.
+fn section_key(title: &str) -> &str {
+    match title {
+        "B&W" => "Color Mixer",
+        title => title,
+    }
+}
+fn section_header(
+    ui: &mut egui::Ui,
+    title: &str,
+    button: HeaderButton,
+    switch: Option<&mut PanelState>,
+    contents: impl FnOnce(&mut egui::Ui),
+) -> bool {
     let resettable = button != HeaderButton::None;
     let id = ui.make_persistent_id(("adjustment-section-v3", title));
+    let key = section_key(title);
+    let group = current_group(ui);
+    if let Some(group) = group {
+        ui.ctx().data_mut(|d| {
+            d.get_temp_mut_or_default::<SectionTitles>(section_titles_id())
+                .entry(group.to_string())
+                .or_default()
+                .insert(key.to_string());
+        });
+    }
     let mut open = !ui.ctx().data(|d| {
         d.get_temp::<std::collections::BTreeSet<String>>(collapsed_sections_id())
-            .is_some_and(|set| set.contains(title))
+            .is_some_and(|set| set.contains(key))
     });
     ui.add_space(8.);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.), Sense::hover());
@@ -147,10 +293,17 @@ pub(super) fn section_with(
         Pos2::new(rect.right() - 16., rect.center().y),
         Vec2::splat(24.),
     );
-    let toggle_right = if resettable {
+    let right = if resettable {
         reset_rect.left()
     } else {
         rect.right()
+    };
+    let switch_rect =
+        Rect::from_center_size(Pos2::new(right - 18., rect.center().y), Vec2::new(26., 20.));
+    let toggle_right = if switch.is_some() {
+        switch_rect.left()
+    } else {
+        right
     };
     let toggle_rect = Rect::from_min_max(rect.min, Pos2::new(toggle_right, rect.bottom()));
     let toggle = ui
@@ -170,6 +323,7 @@ pub(super) fn section_with(
         HeaderButton::Add => reset.on_hover_text(format!("New {}", title.trim_end_matches('s'))),
         HeaderButton::None => reset,
     };
+    let enabled = switch.as_deref().is_none_or(|s| *s == PanelState::On);
     // A filled header band marks each collapsible panel, as in Lightroom.
     ui.painter().rect_filled(
         rect,
@@ -206,7 +360,11 @@ pub(super) fn section_with(
         egui::Align2::LEFT_CENTER,
         title,
         egui::FontId::proportional(13.),
-        theme::gray(if toggle.hovered() { 250 } else { 235 }),
+        theme::gray(match (enabled, toggle.hovered()) {
+            (false, _) => 140,
+            (true, true) => 250,
+            (true, false) => 235,
+        }),
     );
     if resettable {
         let color = theme::gray(if reset.hovered() { 240 } else { 150 });
@@ -217,18 +375,41 @@ pub(super) fn section_with(
         };
         icons::paint_at(ui.painter(), icon, reset_rect.center(), 12., color);
     }
-    if toggle.clicked() {
-        open = !open;
-        ui.ctx().data_mut(|d| {
-            let set = d.get_temp_mut_or_default::<std::collections::BTreeSet<String>>(
-                collapsed_sections_id(),
-            );
-            if open {
-                set.remove(title);
-            } else {
-                set.insert(title.to_string());
+    if let Some(state) = switch {
+        let response = ui
+            .interact(switch_rect, id.with("switch"), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(match state {
+                PanelState::On => format!("Turn {title} off"),
+                PanelState::Off => format!("Turn {title} on"),
+            });
+        paint_switch(
+            ui.painter(),
+            switch_rect.center(),
+            *state,
+            response.hovered(),
+        );
+        if response.clicked() {
+            *state = match state {
+                PanelState::On => PanelState::Off,
+                PanelState::Off => PanelState::On,
+            };
+        }
+    }
+    if let Some(group) = group {
+        context_menu(&toggle, |ui| {
+            if menu_item(ui, "Solo Mode", "", true, solo(ui, group)) {
+                toggle_solo(ui, group, key);
+                ui.close();
             }
         });
+    }
+    if toggle.clicked() && !context_clicked(&toggle) {
+        open = !open;
+        set_open(ui, key, open);
+        if open && let Some(group) = group.filter(|g| solo(ui, g)) {
+            close_others(ui, group, key);
+        }
     }
     if button == HeaderButton::Reset && reset.clicked() {
         name_history_step(ui, format!("Reset {title}"), String::new());
@@ -248,6 +429,33 @@ pub(super) fn section_with(
         });
     }
     resettable && reset.clicked()
+}
+/// Lightroom's panel switch: a small track with its knob to the right when on.
+fn paint_switch(painter: &egui::Painter, c: Pos2, state: PanelState, hovered: bool) {
+    let track = Rect::from_center_size(c, Vec2::new(20., 10.));
+    let on = state == PanelState::On;
+    painter.rect_filled(
+        track,
+        5.,
+        theme::gray(match (on, hovered) {
+            (true, true) => 175,
+            (true, false) => 150,
+            (false, true) => 80,
+            (false, false) => 34,
+        }),
+    );
+    painter.rect_stroke(
+        track,
+        5.,
+        Stroke::new(1., theme::gray(if on { 120 } else { 95 })),
+        egui::StrokeKind::Inside,
+    );
+    let knob = if on {
+        track.right_center() - Vec2::new(5., 0.)
+    } else {
+        track.left_center() + Vec2::new(5., 0.)
+    };
+    painter.circle_filled(knob, 3.5, theme::gray(if on { 235 } else { 140 }));
 }
 #[derive(Clone, Default)]
 struct CurveInteraction {
@@ -336,19 +544,23 @@ fn curve_readout(ui: &mut egui::Ui, value: Option<[f32; 2]>) {
 }
 /// Parametric curve: dragging up or down in the graph changes the region
 /// under the pointer, and the three handles below move the region splits.
+/// The parametric curve; `targeted` is the region a Targeted Adjustment Tool drag is
+/// moving, which shows as a hovered one does.
 pub(super) fn parametric_curve_ui(
     ui: &mut egui::Ui,
     effects: &mut crate::develop::effects::Effects,
+    model: crate::develop::parametric::ParametricModel,
     histogram: &[[u32; 256]; 3],
+    targeted: Option<usize>,
 ) {
     let size = ui.available_width();
     let (outer, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::click_and_drag());
     let rect = outer.shrink(4.);
     curve_backdrop(ui, rect, histogram, 0);
-    let region = |x: f32, splits: [f32; 3]| splits.iter().filter(|s| x > **s).count();
     let hover = response.hover_pos().filter(|p| rect.contains(*p));
-    let hovered_region = hover.map(|p| region((p.x - rect.left()) / rect.width(), effects.splits));
-    if let Some(i) = hovered_region {
+    let hovered_region =
+        hover.map(|p| effects.parametric_region((p.x - rect.left()) / rect.width()));
+    if let Some(i) = hovered_region.or(targeted) {
         let bounds = [
             0.,
             effects.splits[0],
@@ -369,7 +581,7 @@ pub(super) fn parametric_curve_ui(
         && let Some(p) = response.interact_pointer_pos()
     {
         let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(p);
-        let i = region((origin.x - rect.left()) / rect.width(), effects.splits);
+        let i = effects.parametric_region((origin.x - rect.left()) / rect.width());
         let delta = -response.drag_delta().y / rect.height() * 2.;
         effects.parametric[i] = (effects.parametric[i] + delta).clamp(-1., 1.);
     }
@@ -378,12 +590,13 @@ pub(super) fn parametric_curve_ui(
     {
         effects.parametric[i] = 0.;
     }
-    let pts: Vec<_> = (0..=128)
-        .map(|i| {
-            let x = i as f32 / 128.;
+    let pts: Vec<_> = crate::develop::parametric::samples(model, effects, 128)
+        .into_iter()
+        .enumerate()
+        .map(|(i, y)| {
             Pos2::new(
-                rect.left() + x * rect.width(),
-                rect.bottom() - effects.parametric(x) * rect.height(),
+                rect.left() + i as f32 / 128. * rect.width(),
+                rect.bottom() - y * rect.height(),
             )
         })
         .collect();
@@ -628,6 +841,35 @@ pub(super) enum SliderEvent {
     Reset,
 }
 /// `display` overrides the shown scale and decimals, e.g. Sharpening's 0–150.
+/// Whether a slider shows a tick at its fill's origin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tick {
+    Shown,
+    Hidden,
+}
+/// Where a slider's fill starts, and whether it is marked.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FillOrigin {
+    value: f32,
+    tick: Tick,
+}
+/// A slider from zero up fills from zero, as Lightroom's Feather, Amount and Opacity
+/// do, so a default in the middle doesn't make it look centred. Any other (one below
+/// zero, a coloured one like Temp, or one with a neutral point like Levels' Midtone
+/// or Scale) fills from its default and marks it.
+fn fill_origin(start: f32, default: f32, coloured: bool) -> FillOrigin {
+    if start != 0. || coloured {
+        FillOrigin {
+            value: default,
+            tick: Tick::Shown,
+        }
+    } else {
+        FillOrigin {
+            value: start,
+            tick: Tick::Hidden,
+        }
+    }
+}
 pub(super) fn slider_with(
     ui: &mut egui::Ui,
     label: &str,
@@ -649,6 +891,11 @@ pub(super) fn slider_with(
         (1., 2)
     });
     let signed = start < 0. && default == 0.;
+    let origin = fill_origin(
+        start,
+        default,
+        gradient.is_some() || label == "Temp" || label == "Tint",
+    );
     // Like Lightroom, Temp moves evenly in mireds rather than kelvin.
     let reciprocal = label == "Temp" && start > 0.;
     // Dragging Exposure moves in Lightroom's 0.05 EV steps; typed values stay exact.
@@ -767,14 +1014,18 @@ pub(super) fn slider_with(
         } else {
             ui.painter().rect_filled(rail, 1., theme::gray(83));
         }
-        let neutral = to_rail(default, rail);
-        ui.painter().line_segment(
-            [
-                Pos2::new(neutral, area.center().y - 4.),
-                Pos2::new(neutral, area.center().y + 4.),
-            ],
-            Stroke::new(1., theme::gray(115)),
-        );
+        // A tick where a centred slider rests, or a coloured one's default (Temp's As
+        // Shot); a slider from zero up, like Feather, fills from its left end.
+        let neutral = to_rail(origin.value, rail);
+        if origin.tick == Tick::Shown {
+            ui.painter().line_segment(
+                [
+                    Pos2::new(neutral, area.center().y - 4.),
+                    Pos2::new(neutral, area.center().y + 4.),
+                ],
+                Stroke::new(1., theme::gray(115)),
+            );
+        }
         if response.double_clicked() {
             *value = default.clamp(start, end);
             event = SliderEvent::Reset;
@@ -784,6 +1035,11 @@ pub(super) fn slider_with(
             let v = from_rail(p.x, rail);
             let v = step.map_or(v, |step| (v / step).round() * step);
             *value = v.clamp(start, end);
+        } else if let Some(nudge) = hovered_nudge(ui, row) {
+            // Lightroom's keys over a hovered slider: Up and Down move it by its
+            // smallest shown step, ten with Shift.
+            let unit = step.unwrap_or(10f32.powi(-(decimals as i32)) / scale);
+            *value = (*value + nudge * unit).clamp(start, end);
         }
         let x = to_rail(*value, rail);
         if gradient.is_none() {
@@ -828,8 +1084,32 @@ pub(super) fn slider_with(
     }
     event
 }
+/// Steps the Up and Down keys ask of the slider in `row` this frame: +1 or −1 each,
+/// ×10 with Shift. Only while the slider is enabled, the pointer is over the row and no text field (a
+/// slider's number being typed, a search) has the keyboard, which keeps the keys;
+/// Left and Right stay with photo navigation, and scrolling never moves a slider.
+fn hovered_nudge(ui: &egui::Ui, row: Rect) -> Option<f32> {
+    if !ui.is_enabled()
+        || !ui.rect_contains_pointer(row)
+        || ui.ctx().text_edit_focused()
+        || ui.input(|i| i.pointer.any_down())
+    {
+        return None;
+    }
+    let nudge = ui.input_mut(|i| {
+        let mut nudge = 0.;
+        // Shift first: the plain pattern would also take Shift's presses.
+        for (modifiers, size) in [(egui::Modifiers::SHIFT, 10.), (egui::Modifiers::NONE, 1.)] {
+            nudge += size
+                * (i.count_and_consume_key(modifiers, egui::Key::ArrowUp) as f32
+                    - i.count_and_consume_key(modifiers, egui::Key::ArrowDown) as f32);
+        }
+        nudge
+    });
+    (nudge != 0.).then_some(nudge)
+}
 /// A slider's number as shown: Lightroom's scale, with a sign when it has one.
-fn slider_text(v: f64, decimals: usize, signed: bool) -> String {
+pub(super) fn slider_text(v: f64, decimals: usize, signed: bool) -> String {
     let text = format!("{v:.decimals$}");
     if signed && v > 0. && !text.trim_start_matches(['0', '.']).is_empty() {
         format!("+{text}")
@@ -1347,5 +1627,46 @@ pub(super) fn pretty_path(path: &std::path::Path) -> String {
             format!("~{}", &text[home.len()..])
         }
         _ => text,
+    }
+}
+
+#[cfg(test)]
+mod slider_tests {
+    use super::*;
+
+    #[test]
+    fn a_slider_from_zero_fills_from_its_left_end_with_no_centre_mark() {
+        // Feather, 0–100 with 50 as its default: not a centred slider.
+        assert_eq!(
+            fill_origin(0., 0.5, false),
+            FillOrigin {
+                value: 0.,
+                tick: Tick::Hidden
+            }
+        );
+        // Exposure, centred on 0.
+        assert_eq!(
+            fill_origin(-5., 0., false),
+            FillOrigin {
+                value: 0.,
+                tick: Tick::Shown
+            }
+        );
+        // Scale, 50–150% around a neutral 100%, keeps its mark.
+        assert_eq!(
+            fill_origin(0.5, 1., false),
+            FillOrigin {
+                value: 1.,
+                tick: Tick::Shown
+            }
+        );
+        // Temp keeps its As Shot mark.
+        assert_eq!(
+            fill_origin(2000., 5500., true),
+            FillOrigin {
+                value: 5500.,
+                tick: Tick::Shown
+            }
+        );
     }
 }

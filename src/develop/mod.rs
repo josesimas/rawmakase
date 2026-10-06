@@ -4,10 +4,12 @@ mod basic_tone;
 mod basic_tone_data;
 mod black_white;
 pub(crate) mod calibration;
+pub mod clarity;
 pub(crate) mod color;
-mod color_grade;
+pub mod color_grade;
+mod color_grade_curves;
 mod color_grade_data;
-mod color_mixer;
+pub mod color_mixer;
 mod crop_constraint;
 pub mod curve;
 pub mod defaults;
@@ -21,12 +23,16 @@ mod local_tone_data;
 pub mod masks;
 mod orientation;
 pub mod panels;
+pub mod parametric;
 mod pipeline;
 pub mod point_color;
 mod preview_renderer;
 mod pyramid;
 pub mod settings_groups;
+pub mod sharpening;
+pub mod targeted;
 pub mod upright;
+pub use pipeline::GamutModel;
 pub use preview_renderer::PreviewRenderer;
 pub mod quality;
 mod recipe;
@@ -38,9 +44,10 @@ mod white_balance;
 
 pub use crate::color_math::{mul, srgb_encode};
 pub use auto::{
-    auto_tone, auto_tone_basis, auto_tone_cancellable, auto_white_balance,
+    AutoTone, auto_tone, auto_tone_basis, auto_tone_cancellable, auto_white_balance,
     auto_white_balance_cancellable,
 };
+pub use basic_tone::{ContrastModel, WhitesModel};
 pub use black_white::{AutoMix, ColorSpread, Treatment, is_monochrome};
 pub use geometry::{Geometry, Transform, Upright, UprightGuide, UprightMode, display_axes};
 pub use image_space::{ImageFrame, ViewMapping};
@@ -51,7 +58,7 @@ pub use pipeline::{
 pub(crate) use pipeline::{profile_matrix, render_base};
 pub use recipe::{
     LocalEdits, ProfileCorrections, ProfilePreference, Recipe, TEMPERATURE_MAX, TEMPERATURE_MIN,
-    TINT_LIMIT,
+    TINT_LIMIT, camera_matching_names, camera_matching_profile,
 };
 pub(crate) use rendered::unit_to_u8;
 pub use rendered::{ClipOverlay, Clipped, HIGHLIGHT_CLIP, Histogram, Rendered, SHADOW_CLIP};

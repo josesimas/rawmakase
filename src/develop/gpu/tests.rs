@@ -251,6 +251,10 @@ fn gpu_develop_matches_cpu_pixel_stage() -> Result<()> {
     r.white_point = 0.97;
     r.midtone = 1.2;
     recipes.push(r.clone());
+    // The measured parametric curve, with moved splits, from here on.
+    r.parametric_model = crate::develop::parametric::ParametricModel::Measured;
+    r.effects.parametric = [0.3, 0.2, -0.3, -0.2];
+    r.effects.splits = [0.2, 0.45, 0.8];
     r.shadows = 0.5;
     r.highlights = -0.6;
     recipes.push(r.clone());
@@ -263,6 +267,21 @@ fn gpu_develop_matches_cpu_pixel_stage() -> Result<()> {
     r.effects.calibration = [[0.3, -0.2], [-0.4, 0.5], [0.2, 0.1]];
     r.effects.shadow_tint = -0.4;
     recipes.push(r.clone());
+    // Measured grading curves, at Blending and Balance the original tables don't cover.
+    let mut measured = r.clone();
+    measured.grading_model = crate::develop::color_grade::GradingModel::Measured;
+    measured.grading[2] = [0.1, 0.5, 0.2];
+    measured.effects.blending = 0.8;
+    measured.effects.balance = -0.3;
+    recipes.push(measured.clone());
+    // Out-of-gamut colors clipped per channel.
+    measured.gamut_model = crate::develop::GamutModel::Clip;
+    measured.saturation = 0.8;
+    recipes.push(measured.clone());
+    // Calibration measured on Camera Raw, between its measured slider positions.
+    measured.calibration_model = crate::develop::calibration::CalibrationModel::Measured;
+    measured.effects.calibration = [[0.3, -0.75], [-0.4, 0.5], [0.9, 0.1]];
+    recipes.push(measured);
     // Point Color: overlapping swatches, one across red, with Variance and Range.
     let mut warm = crate::develop::point_color::PointColor::sampled([0.6, 0.5, 0.2]);
     warm.shift = [0.4, -0.5, 0.3];
@@ -277,6 +296,11 @@ fn gpu_develop_matches_cpu_pixel_stage() -> Result<()> {
     r.point_colors = vec![warm, red, cool];
     let point_colors = recipes.len();
     recipes.push(r.clone());
+    // Visualize Range of the second swatch.
+    let mut visualized = r.clone();
+    visualized.point_colors =
+        crate::develop::point_color::visualize_range(&r.point_colors, 1).unwrap();
+    recipes.push(visualized);
     r.effects.defringe = [0.5, 0.3];
     recipes.push(r.clone());
     r.effects.monochrome = true;
@@ -463,18 +487,31 @@ fn presented_previews_match_the_cpu_render() -> Result<()> {
         highlights: true,
         ..none
     };
-    for (spatial, clipping, ca, (style, vignette)) in [
-        (false, shadows, 0, (HighlightPriority, 0.)),
-        (true, none, 0, (HighlightPriority, -0.3)),
-        (true, both, 0, (ColorPriority, -0.6)),
-        (true, highlights, 0, (PaintOverlay, -0.5)),
-        (true, none, 1, (HighlightPriority, 0.5)),
-        (true, none, 2, (ColorPriority, 0.4)),
-        (true, none, 0, (PaintOverlay, 0.7)),
+    use crate::develop::effects::LensVignetteModel::{Measured, Original};
+    for (spatial, clipping, ca, (style, vignette), lens_vignette) in [
+        (false, shadows, 0, (HighlightPriority, 0.), Original),
+        (true, none, 0, (HighlightPriority, -0.3), Original),
+        (true, both, 0, (ColorPriority, -0.6), Original),
+        (true, highlights, 0, (PaintOverlay, -0.5), Original),
+        (true, none, 1, (HighlightPriority, 0.5), Original),
+        (true, none, 2, (ColorPriority, 0.4), Original),
+        (true, none, 0, (PaintOverlay, 0.7), Original),
+        // Measured manual Vignetting is sampled with the lens profile's.
+        (true, none, 0, (HighlightPriority, -0.3), Measured),
+        (true, none, 0, (ColorPriority, 0.), Measured),
     ] {
         let mut recipe = base.clone();
+        recipe.lens_vignette_model = lens_vignette;
         if spatial {
             recipe.effects.grain = 0.4;
+            // The measured grain on Color Priority cases, the original on the others.
+            if style == ColorPriority {
+                recipe.grain_model = crate::develop::effects::GrainModel::Measured;
+            }
+            // The measured Clarity, in the map, on Paint Overlay cases.
+            if style == PaintOverlay {
+                recipe.clarity_model = crate::develop::clarity::ClarityModel::Measured;
+            }
             recipe.effects.vignette = vignette;
             recipe.effects.vignette_style = style;
             recipe.effects.vignette_highlights = 0.6;
@@ -500,6 +537,11 @@ fn presented_previews_match_the_cpu_render() -> Result<()> {
         if ca > 0 {
             recipe.lens_builtin = ca == 2;
             recipe.lens_ca = true;
+        }
+        if lens_vignette == Measured && vignette == 0. {
+            // Without lens data: the manual gain alone makes the lens stage.
+            recipe.lens_builtin = false;
+            recipe.effects.lens_vignette = -0.6;
         }
         for (max_edge, region) in [(60, None), (0, None), (0, Some([10, 7, 50, 40]))] {
             let display = super::Display {
@@ -777,21 +819,38 @@ fn gpu_masks_match_cpu_pixel_stage() -> Result<()> {
     let mut gpu = Processor::new()?;
     let cancel = AtomicBool::new(false);
     let source = Source::from(image.as_ref());
-    let mut params = pixel_params(source, &r).expect("GPU port covers this recipe");
-    assert!(params.set_masks(source, &r, Some(&weights)));
-    let expected = develop_samples(source, &r, &samples, &cancel, Some(&weights))?;
-    let actual = gpu.develop(&samples, &params, &cancel)?;
-    let d: Vec<f32> = actual
-        .pixels
-        .iter()
-        .flatten()
-        .zip(expected.pixels.iter().flatten())
-        .map(|(a, b)| (a - b).abs())
-        .collect();
-    let mean = d.iter().sum::<f32>() / d.len() as f32;
-    let max = d.iter().copied().fold(0., f32::max);
-    eprintln!("masks: max {max:.6}, mean {mean:.8}");
-    assert!(max < 2e-3 && mean < 2e-5, "max {max}, mean {mean}");
+    r.whites = 0.3;
+    for (model, whites) in [
+        (
+            crate::develop::ContrastModel::Original,
+            crate::develop::WhitesModel::Original,
+        ),
+        (
+            crate::develop::ContrastModel::Adaptive,
+            crate::develop::WhitesModel::Adaptive,
+        ),
+    ] {
+        r.contrast_model = model;
+        r.whites_model = whites;
+        let mut params = pixel_params(source, &r).expect("GPU port covers this recipe");
+        assert!(params.set_masks(source, &r, Some(&weights)));
+        let expected = develop_samples(source, &r, &samples, &cancel, Some(&weights))?;
+        let actual = gpu.develop(&samples, &params, &cancel)?;
+        let d: Vec<f32> = actual
+            .pixels
+            .iter()
+            .flatten()
+            .zip(expected.pixels.iter().flatten())
+            .map(|(a, b)| (a - b).abs())
+            .collect();
+        let mean = d.iter().sum::<f32>() / d.len() as f32;
+        let max = d.iter().copied().fold(0., f32::max);
+        eprintln!("masks, {model:?}: max {max:.6}, mean {mean:.8}");
+        assert!(
+            max < 2e-3 && mean < 2e-5,
+            "{model:?}: max {max}, mean {mean}"
+        );
+    }
     Ok(())
 }
 

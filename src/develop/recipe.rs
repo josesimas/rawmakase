@@ -21,6 +21,13 @@ pub struct Recipe {
     /// matches the lens, in place of the built-in correction.
     #[serde(default)]
     pub lens_profile: bool,
+    /// Lightroom's profile Setup and the profile the edit names. Omitted at Default
+    /// with no profile named, so releases that predate it read the recipe.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::lens::choice::LensProfileChoice::is_default"
+    )]
+    pub lens_profile_choice: crate::lens::choice::LensProfileChoice,
     /// Profile correction amounts, Lightroom's Distortion and Vignetting sliders
     /// (0–2, 1 = 100).
     #[serde(default = "one")]
@@ -41,6 +48,20 @@ pub struct Recipe {
     #[serde(default)]
     pub profile_tone: bool,
     pub effects: crate::develop::effects::Effects,
+    /// Which operator renders Grain. Missing means the original grain, so recipes
+    /// saved before the measured one look as they did; omitted at that default, and
+    /// kept by releases that predate it.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::develop::effects::GrainModel::is_original"
+    )]
+    pub grain_model: crate::develop::effects::GrainModel,
+    /// Which operator renders positive Clarity, as `grain_model`.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::develop::clarity::ClarityModel::is_original"
+    )]
+    pub clarity_model: crate::develop::clarity::ClarityModel,
     pub preset_name: String,
     pub preset_settings: std::collections::BTreeMap<String, String>,
     pub profile: Option<std::sync::Arc<crate::camera_profiles::CameraProfile>>,
@@ -49,6 +70,14 @@ pub struct Recipe {
     /// at 1, so releases that predate it read the recipe.
     #[serde(default = "one", skip_serializing_if = "is_one")]
     pub profile_amount: f32,
+    /// Which operator renders Sharpening. Missing means the original unsharp mask, so
+    /// recipes saved before the measured one look as they did; omitted at that
+    /// default, and kept by releases that predate it.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::develop::sharpening::SharpeningModel::is_original"
+    )]
+    pub sharpening_model: crate::develop::sharpening::SharpeningModel,
     pub sharpening_radius: f32,
     pub sharpening_detail: f32,
     pub sharpening_masking: f32,
@@ -64,6 +93,74 @@ pub struct Recipe {
     /// RGB-hue grading and reference-calibrated color response. Missing means legacy.
     #[serde(default)]
     pub reference_color: bool,
+    /// How the Tone Curve's parametric regions render. Missing means the original
+    /// approximation, so recipes saved before the measured curve look as they did;
+    /// omitted at that default, and kept by releases that predate it.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::develop::parametric::ParametricModel::is_original"
+    )]
+    pub parametric_model: crate::develop::parametric::ParametricModel,
+    /// Whether Contrast pivots where the photo puts it, after Whites and Blacks.
+    /// Missing means the original averaged curve before them, so older recipes look as
+    /// they did; omitted at that default, and kept by releases that predate it.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::develop::basic_tone::ContrastModel::is_original"
+    )]
+    pub contrast_model: crate::develop::basic_tone::ContrastModel,
+    /// How manual lens Vignetting renders. Missing means the original operator, so
+    /// recipes saved before the measured one look as they did; omitted at that
+    /// default, and kept by releases that predate it.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::develop::effects::LensVignetteModel::is_original"
+    )]
+    pub lens_vignette_model: crate::develop::effects::LensVignetteModel,
+    /// The soft edge Heal and Clone render with. Missing means the original one, so
+    /// recipes saved before the measured feather look as they did; omitted at that
+    /// default, and kept by releases that predate it.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::develop::retouch::RetouchModel::is_original"
+    )]
+    pub retouch_model: crate::develop::retouch::RetouchModel,
+    /// How color grading renders. Missing means the original operator, so recipes
+    /// saved before the measured curves look as they did; omitted at that default.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::develop::color_grade::GradingModel::is_original"
+    )]
+    pub grading_model: crate::develop::color_grade::GradingModel,
+    /// Which measured tables render the color mixer. Missing means the tables
+    /// measured on photos, so older recipes look as they did; omitted at that default.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::develop::color_mixer::MixerModel::is_original"
+    )]
+    pub mixer_model: crate::develop::color_mixer::MixerModel,
+    /// Which fit renders Camera Calibration's primary sliders. Missing means the
+    /// original coefficients, so older recipes look as they did; omitted at that default.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::develop::calibration::CalibrationModel::is_original"
+    )]
+    pub calibration_model: crate::develop::calibration::CalibrationModel,
+    /// Whether positive Whites follows the photo's highlights. Missing means the
+    /// original median curve, so older recipes look as they did; omitted at that
+    /// default, and kept by releases that predate it.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::develop::basic_tone::WhitesModel::is_original"
+    )]
+    pub whites_model: crate::develop::basic_tone::WhitesModel,
+    /// How out-of-gamut colors reach sRGB. Missing means compressed, so recipes saved
+    /// before the clipped model look as they did; omitted at that default.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::develop::GamutModel::is_compress"
+    )]
+    pub gamut_model: crate::develop::GamutModel,
     pub temperature: f32,
     pub tint: f32,
     pub wb: [f32; 3],
@@ -163,15 +260,19 @@ impl Default for Recipe {
             engine: 4,
             lens_builtin: true,
             lens_profile: false,
+            lens_profile_choice: Default::default(),
             lens_distortion: 1.,
             lens_vignetting: 1.,
             lens_manual_distortion: 0.,
             lens_ca: false,
             profile_tone: true,
             effects: Default::default(),
+            grain_model: Default::default(),
+            clarity_model: Default::default(),
             preset_name: String::new(),
             preset_settings: Default::default(),
             profile: None,
+            sharpening_model: Default::default(),
             sharpening_radius: 0.8,
             sharpening_detail: 0.25,
             sharpening_masking: 0.35,
@@ -181,6 +282,15 @@ impl Default for Recipe {
             reference_curves: false,
             reference_calibration: false,
             reference_color: false,
+            parametric_model: Default::default(),
+            contrast_model: Default::default(),
+            lens_vignette_model: Default::default(),
+            retouch_model: Default::default(),
+            grading_model: Default::default(),
+            mixer_model: Default::default(),
+            calibration_model: Default::default(),
+            whites_model: Default::default(),
+            gamut_model: Default::default(),
             temperature: 6500.,
             tint: 0.,
             wb: [1.; 3],
@@ -227,6 +337,31 @@ pub enum ProfilePreference {
     Adobe,
     /// RAWmakase Color wherever it fits the camera, else as `Adobe`.
     Rawmakase,
+    /// Lightroom's Camera Settings: the imported profile matching the camera's
+    /// standard look (see [`camera_matching_profile`]), else as `Adobe`.
+    Camera,
+}
+/// Names of the camera-matching profile Adobe ships for a camera's standard
+/// look, by maker. RAWmakase doesn't read the picture style set in the camera,
+/// so Camera Settings always starts from this one.
+pub fn camera_matching_names(m: &Metadata) -> &'static [&'static str] {
+    let make = m.make.trim().to_ascii_lowercase();
+    if make.starts_with("fujifilm") {
+        &["Camera PROVIA/Standard"]
+    } else {
+        &["Camera Standard"]
+    }
+}
+/// The imported camera-matching profile for this camera's standard look.
+pub fn camera_matching_profile<'a>(
+    m: &Metadata,
+    profiles: &'a [std::sync::Arc<crate::camera_profiles::CameraProfile>],
+) -> Option<&'a std::sync::Arc<crate::camera_profiles::CameraProfile>> {
+    camera_matching_names(m).iter().find_map(|name| {
+        profiles
+            .iter()
+            .find(|p| p.name == *name && p.ensure_camera(m).is_ok())
+    })
 }
 impl Recipe {
     /// The look at its Profile Amount, and its internal controls added to the user's
@@ -289,7 +424,13 @@ impl Recipe {
             }
         }
         let e = &mut self.effects;
-        if s.parametric != [0.; 4] {
+        // The layered curve renders a look's parametric curve as a curve of its own,
+        // on the measured path only; elsewhere the look's regions join the user's.
+        let merge_parametric = !(self.parametric_model
+            == crate::develop::parametric::ParametricModel::Layered
+            && self.engine >= 4
+            && self.reference_curves);
+        if s.parametric != [0.; 4] && merge_parametric {
             for (v, l) in e.parametric.iter_mut().zip(s.parametric) {
                 *v = add(*v, l);
             }
@@ -297,7 +438,10 @@ impl Recipe {
                 e.splits = s.splits;
             }
         }
-        if let Some(t) = s.toning {
+        // The measured grading renders a look's split toning as a pass of its own.
+        let merge_toning =
+            self.grading_model == crate::develop::color_grade::GradingModel::Original;
+        if let Some(t) = s.toning.filter(|_| merge_toning) {
             // Split toning, as Lightroom's looks store it, overlaps all tones; the
             // user's own toning of shadows or highlights wins over the look's.
             if self.grading.iter().all(|g| g[1] == 0. && g[2] == 0.) && e.global_grade == [0.; 3] {
@@ -352,6 +496,7 @@ impl Recipe {
         let own = match preference {
             ProfilePreference::Adobe => None,
             ProfilePreference::Rawmakase => find(crate::camera_profiles::open::COLOR),
+            ProfilePreference::Camera => camera_matching_profile(m, profiles),
         };
         // As in Lightroom: Adobe Color, else Adobe Standard. Without those, a DNG
         // keeps the profile it embeds, and any other file gets RAWmakase Color.
@@ -372,6 +517,18 @@ impl Recipe {
         recipe.reference_color = true;
         recipe.reference_curves = true;
         recipe.reference_calibration = true;
+        recipe.parametric_model = crate::develop::parametric::ParametricModel::Layered;
+        recipe.set_sharpening_defaults(crate::develop::sharpening::SharpeningModel::Measured);
+        recipe.grain_model = crate::develop::effects::GrainModel::Measured;
+        recipe.clarity_model = crate::develop::clarity::ClarityModel::Measured;
+        recipe.contrast_model = crate::develop::basic_tone::ContrastModel::Adaptive;
+        recipe.lens_vignette_model = crate::develop::effects::LensVignetteModel::Measured;
+        recipe.retouch_model = crate::develop::retouch::RetouchModel::Measured;
+        recipe.grading_model = crate::develop::color_grade::GradingModel::Measured;
+        recipe.mixer_model = crate::develop::color_mixer::MixerModel::Chart;
+        recipe.calibration_model = crate::develop::calibration::CalibrationModel::Measured;
+        recipe.whites_model = crate::develop::basic_tone::WhitesModel::Adaptive;
+        recipe.gamut_model = crate::develop::GamutModel::Clip;
         recipe.use_camera_baseline(m);
         recipe.reset_white_balance(m);
         recipe
@@ -522,34 +679,132 @@ impl Recipe {
             self.lens_builtin = self.lens_profile;
         }
     }
-    /// Why Enable Profile Corrections cannot render with an Adobe profile here, and
-    /// what renders instead, when it is on.
+    /// The imported Adobe profile Enable Profile Corrections uses here, and the one
+    /// the edit names when it isn't imported.
+    pub fn lens_profile_in_use<'c, 'p>(
+        &'c self,
+        m: &'p Metadata,
+    ) -> crate::lens::choice::Resolved<'c, 'p> {
+        if !self.lens_profile || self.engine < 4 {
+            return Default::default();
+        }
+        self.lens_profile_choice.resolve(&m.lens_profiles, m)
+    }
+    /// Why Enable Profile Corrections cannot render with the Adobe profile it should
+    /// here, and what renders instead, when it is on.
     pub fn missing_lens_profile(&self, m: &Metadata) -> Option<String> {
         // A Lens Corrections panel switched off renders no lens correction at all.
         let panel = self
             .panels
             .state(crate::develop::panels::Panel::LensCorrections);
-        if !self.lens_profile
-            || m.profile_lens.is_some()
-            || panel == crate::develop::panels::PanelState::Off
-            || self.engine < 4
+        if panel == crate::develop::panels::PanelState::Off || !self.lens_profile || self.engine < 4
         {
             return None;
         }
-        let lens = if m.lens_model.is_empty() {
-            "this lens".to_string()
-        } else {
-            m.lens_model.clone()
+        let resolved = self.lens_profile_in_use(m);
+        // The profile the RAW carries renders as its built-in correction.
+        if let Some(id) = self
+            .lens_profile_choice
+            .id
+            .as_ref()
+            .filter(|id| id.embedded)
+        {
+            return m.lens.as_ref().filter(|_| self.lens_builtin).is_none().then(|| {
+                format!(
+                    "Lens profile \"{}\" comes with the camera, but this file has none; no lens correction",
+                    id.label()
+                )
+            });
+        }
+        let profile = match (resolved.missing, m.lens_model.as_str()) {
+            (Some(id), _) => format!("Lens profile \"{}\"", id.label()),
+            (None, _) if resolved.used.is_some() => return None,
+            (None, "") => "Adobe lens profile for this lens".to_string(),
+            (None, lens) => format!("Adobe lens profile for {lens}"),
         };
-        Some(match m.lens.as_ref().filter(|_| self.lens_builtin) {
-            Some(builtin) => format!(
-                "Adobe lens profile for {lens} isn't imported; using {}",
-                builtin.source
-            ),
-            None => format!("Adobe lens profile for {lens} isn't imported; no lens correction"),
-        })
+        let instead = match (resolved.used, m.lens.as_ref().filter(|_| self.lens_builtin)) {
+            (Some(used), _) => format!("using {}", used.profile.name),
+            (None, Some(builtin)) => format!("using {}", builtin.source),
+            (None, None) => "no lens correction".to_string(),
+        };
+        Some(format!("{profile} isn't imported; {instead}"))
     }
-    /// The built-in lens correction to apply, if enabled and present in the file.
+    /// The lens correction to apply: the Adobe profile in use, else the built-in
+    /// correction if enabled and present in the file.
+    /// Manual lens Vignetting as measured in Camera Raw, applied with the lens
+    /// profile's to the camera image; `None` at Amount 0 and for recipes that keep the
+    /// original operator, which [`crate::develop::effects::spatial_finish`] applies.
+    pub(crate) fn manual_vignette(&self) -> Option<crate::develop::effects::ManualVignette> {
+        if self.lens_vignette_model.is_original() {
+            return None;
+        }
+        crate::develop::effects::ManualVignette::new(
+            self.effects.lens_vignette,
+            self.effects.lens_vignette_midpoint,
+        )
+    }
+    /// Adds a Heal or Clone operation. The first on a recipe has no spots of the
+    /// original feather to keep, so it takes the measured one.
+    pub fn add_retouch(&mut self, op: crate::develop::retouch::RetouchOp) {
+        if self.retouch.is_empty() {
+            self.retouch_model = crate::develop::retouch::RetouchModel::Measured;
+        }
+        self.retouch.push(op);
+    }
+    /// After an edit of manual Vignetting from Amount `previous`: an Amount moved from 0
+    /// has nothing of the original operator's to keep, so it takes the measured one.
+    pub fn adopt_measured_vignette(&mut self, previous: f32) {
+        if previous == 0. && self.effects.lens_vignette != 0. {
+            self.lens_vignette_model = crate::develop::effects::LensVignetteModel::Measured;
+        }
+    }
+    /// The manual lens Vignetting Amount the finishing stage applies: only the
+    /// original operator's; the measured one is applied with the lens profile.
+    pub(crate) fn finished_lens_vignette(&self) -> f32 {
+        if self.lens_vignette_model.is_original() {
+            self.effects.lens_vignette
+        } else {
+            0.
+        }
+    }
+    /// Calibration's Update: the current process, with the camera's built-in profile
+    /// and the sharpening that version 3 introduced for older recipes.
+    pub fn update_process(&mut self, m: Option<&Metadata>) {
+        if self.engine < 3 {
+            self.profile = m.and_then(crate::camera_profiles::builtin);
+            if self.sharpening == 0. {
+                self.sharpening =
+                    crate::develop::sharpening::SharpeningSliders::defaults(self.sharpening_model)
+                        .amount;
+            }
+        }
+        self.engine = 4;
+    }
+    /// The Sharpening sliders at their defaults for `model`, which the recipe then
+    /// uses: Lightroom's for raw files (Amount 40, Radius 1.0, Detail 25, Masking 0)
+    /// with the measured operator, RAWmakase's earlier ones with the original.
+    pub fn set_sharpening_defaults(&mut self, model: crate::develop::sharpening::SharpeningModel) {
+        let d = crate::develop::sharpening::SharpeningSliders::defaults(model);
+        self.sharpening_model = model;
+        self.sharpening = if self.engine >= 3 { d.amount } else { 0. };
+        self.sharpening_radius = d.radius;
+        self.sharpening_detail = d.detail;
+        self.sharpening_masking = d.masking;
+    }
+    /// After an edit of Grain from Amount `previous`: grain added from none has nothing
+    /// of the original operator's to keep, so it takes the measured one.
+    pub fn adopt_measured_grain(&mut self, previous: f32) {
+        if previous == 0. && self.effects.grain != 0. {
+            self.grain_model = crate::develop::effects::GrainModel::Measured;
+        }
+    }
+    /// After an edit of Clarity from `previous`: Clarity added from none has nothing
+    /// of the original operator's to keep, so it takes the measured one.
+    pub fn adopt_measured_clarity(&mut self, previous: f32) {
+        if previous == 0. && self.effects.clarity != 0. {
+            self.clarity_model = crate::develop::clarity::ClarityModel::Measured;
+        }
+    }
     pub(crate) fn lens_correction<'a>(
         &self,
         m: &'a Metadata,
@@ -557,9 +812,9 @@ impl Recipe {
         if self.engine < 4 {
             return None;
         }
-        m.profile_lens
-            .as_ref()
-            .filter(|_| self.lens_profile)
+        self.lens_profile_in_use(m)
+            .used
+            .and_then(|c| c.correction(m))
             .or_else(|| m.lens.as_ref().filter(|_| self.lens_builtin))
     }
     /// Recipe as rendered: switched-off panels bypassed, profile-internal adjustments

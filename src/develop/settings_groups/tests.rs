@@ -31,6 +31,13 @@ fn everything_changed() -> Recipe {
         engine: 3,
         lens_builtin: false,
         lens_profile: true,
+        lens_profile_choice: crate::lens::choice::LensProfileChoice {
+            setup: crate::lens::choice::LensProfileSetup::Custom,
+            id: Some(crate::lens::choice::LensProfileId {
+                name: "Adobe (Test 35mm)".into(),
+                ..Default::default()
+            }),
+        },
         lens_distortion: 0.5,
         lens_vignetting: 1.5,
         lens_manual_distortion: -0.2,
@@ -47,6 +54,18 @@ fn everything_changed() -> Recipe {
         reference_curves: true,
         reference_calibration: true,
         reference_color: true,
+        parametric_model: crate::develop::parametric::ParametricModel::Layered,
+        sharpening_model: crate::develop::sharpening::SharpeningModel::Measured,
+        grain_model: crate::develop::effects::GrainModel::Measured,
+        clarity_model: crate::develop::clarity::ClarityModel::Measured,
+        contrast_model: crate::develop::basic_tone::ContrastModel::Adaptive,
+        lens_vignette_model: crate::develop::effects::LensVignetteModel::Measured,
+        retouch_model: crate::develop::retouch::RetouchModel::Measured,
+        grading_model: crate::develop::color_grade::GradingModel::Measured,
+        mixer_model: crate::develop::color_mixer::MixerModel::Chart,
+        calibration_model: crate::develop::calibration::CalibrationModel::Measured,
+        whites_model: crate::develop::basic_tone::WhitesModel::Adaptive,
+        gamut_model: crate::develop::GamutModel::Clip,
         temperature: 4000.,
         tint: 12.,
         wb: [1.5, 1., 0.8],
@@ -588,5 +607,72 @@ fn a_black_and_white_profile_carries_its_treatment_to_another_camera() {
     assert_eq!(
         out.recipe.treatment(),
         crate::develop::Treatment::BlackWhite
+    );
+}
+
+#[test]
+fn a_lens_profile_the_target_cannot_use_is_reported() {
+    use crate::lens::choice::{LensProfileSetup, tests};
+    let m = tests::photo();
+    let mut source = Recipe {
+        lens_profile: true,
+        ..Default::default()
+    };
+    let other = &m
+        .lens_profiles
+        .all()
+        .iter()
+        .find(|c| c.profile.filename == tests::OTHER)
+        .unwrap()
+        .profile;
+    source.lens_profile_choice.choose(other);
+    let target = |m| Target {
+        metadata: m,
+        profiles: &[],
+    };
+    let out = transfer(
+        from(&source, &m),
+        &Recipe::default(),
+        &GroupSelection::default(),
+        target(&m),
+    );
+    assert!(out.notes.is_empty(), "{:?}", out.notes);
+    // A photo without that profile keeps the choice and says so.
+    let mut bare = m.clone();
+    bare.lens_profiles = Default::default();
+    let out = transfer(
+        from(&source, &m),
+        &Recipe::default(),
+        &GroupSelection::default(),
+        target(&bare),
+    );
+    assert_eq!(
+        out.recipe.lens_profile_choice.setup,
+        LensProfileSetup::Custom
+    );
+    assert!(
+        out.notes
+            .iter()
+            .any(|n| n.contains("Adobe (Lensco 50mm F1.4)")),
+        "{:?}",
+        out.notes
+    );
+    // So is the camera's own profile on a photo whose RAW has none.
+    let mut embedded = source.clone();
+    embedded.lens_profile_choice.id = Some(crate::lens::choice::LensProfileId {
+        name: "Camera Settings".into(),
+        embedded: true,
+        ..Default::default()
+    });
+    let out = transfer(
+        from(&embedded, &m),
+        &Recipe::default(),
+        &GroupSelection::default(),
+        target(&m),
+    );
+    assert!(
+        out.notes.iter().any(|n| n.contains("Camera Settings")),
+        "{:?}",
+        out.notes
     );
 }

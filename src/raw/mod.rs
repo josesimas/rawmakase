@@ -27,6 +27,14 @@ pub struct Metadata {
     pub xtrans: bool,
     #[serde(default)]
     pub fuji_dynamic_range: u32,
+    /// Canon Highlight Tone Priority, from the maker notes; `Off` for other makes.
+    #[serde(default)]
+    pub highlight_tone_priority: HighlightTonePriority,
+    /// Fujifilm's exposure midpoint shift in EV (maker note ExpoMidPointShift): about
+    /// −0.7 at DR100, a stop lower for each DR step up, a stop higher at extended
+    /// low ISO. `None` when the raw has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuji_exposure_shift: Option<f32>,
     pub iso: f32,
     pub shutter: f32,
     pub aperture: f32,
@@ -46,12 +54,13 @@ pub struct Metadata {
     /// Lens model as recorded by the camera, e.g. "FE 55mm F1.8 ZA".
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub lens_model: String,
-    /// DNG BaselineExposure, when the file is a DNG that records one.
+    /// DNG BaselineExposure (0 when the DNG has none); `None` for other formats.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline_exposure: Option<f32>,
-    /// Correction from an imported Adobe lens profile matching this lens; rebuilt on open.
+    /// Imported Adobe lens profiles that fit this camera, Enable Profile Corrections'
+    /// choices; rebuilt on open.
     #[serde(skip)]
-    pub profile_lens: Option<crate::lens::LensCorrection>,
+    pub lens_profiles: crate::lens::lcp::PhotoProfiles,
     /// Lateral chromatic aberration measured from the decoded image, shared by every
     /// image made from it (see `crate::lens::auto_ca::prime`).
     #[serde(skip)]
@@ -59,6 +68,26 @@ pub struct Metadata {
     /// Camera profile embedded in a DNG; rebuilt from the file on open.
     #[serde(skip)]
     pub embedded_profile: Option<std::sync::Arc<crate::camera_profiles::CameraProfile>>,
+}
+/// Canon Highlight Tone Priority: the camera exposes a stop darker to keep
+/// highlights, and Camera Raw brightens the photo by that stop again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HighlightTonePriority {
+    #[default]
+    Off,
+    On,
+    /// "Enhanced" (D+2) on recent bodies. No sample has been measured yet.
+    Enhanced,
+}
+impl HighlightTonePriority {
+    /// From LibRaw's `makernotes.canon.HighlightTonePriority`.
+    fn from_libraw(v: i32) -> Self {
+        match v {
+            1 => Self::On,
+            2 => Self::Enhanced,
+            _ => Self::Off,
+        }
+    }
 }
 /// Which demosaic full-size development uses. A process-wide preference: the app sets
 /// it from its settings, and RAWMAKASE_LIBRAW_DEMOSAIC=1 forces LibRaw.
@@ -122,6 +151,9 @@ impl Raw {
             flip: m.flip,
             xtrans: m.xtrans != 0,
             fuji_dynamic_range: m.fuji_dynamic_range,
+            highlight_tone_priority: HighlightTonePriority::from_libraw(m.highlight_tone_priority),
+            // LibRaw leaves -999 when the maker notes have no shift.
+            fuji_exposure_shift: (m.fuji_exposure_shift > -100.).then_some(m.fuji_exposure_shift),
             iso: m.iso,
             shutter: m.shutter,
             aperture: m.aperture,
@@ -134,7 +166,7 @@ impl Raw {
             lens: crate::lens::embedded::read(path_ref),
             lens_model: text(&m.lens).trim().to_string(),
             baseline_exposure: None,
-            profile_lens: None,
+            lens_profiles: Default::default(),
             lateral_ca: Default::default(),
             embedded_profile: None,
         };
@@ -142,7 +174,8 @@ impl Raw {
         let dng = crate::dng::read(path_ref);
         let mut crop = fuji_crop(path_ref);
         if let Some(dng) = dng {
-            metadata.baseline_exposure = dng.baseline_exposure;
+            // 0 is the DNG default; the camera table is for other raw formats.
+            metadata.baseline_exposure = Some(dng.baseline_exposure.unwrap_or(0.));
             metadata.embedded_profile = dng
                 .profile
                 .filter(|p| p.ensure_camera(&metadata).is_ok())
@@ -177,7 +210,7 @@ impl Raw {
             metadata.crop_width = width;
             metadata.crop_height = height;
         }
-        metadata.profile_lens = crate::lens::lcp::installed(&metadata);
+        metadata.lens_profiles = crate::lens::lcp::library().for_photo(&metadata);
         Ok(Self { handle, metadata })
     }
     /// The embedded JPEG preview, as stored.
@@ -314,6 +347,14 @@ pub(crate) fn thumbnail(raw: &mut Raw) -> anyhow::Result<image::RgbImage> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn reads_highlight_tone_priority_from_libraw() {
+        use super::HighlightTonePriority as H;
+        assert_eq!(H::from_libraw(0), H::Off);
+        assert_eq!(H::from_libraw(1), H::On);
+        assert_eq!(H::from_libraw(2), H::Enhanced);
+        assert_eq!(H::from_libraw(-1), H::Off);
+    }
+    #[test]
     fn reads_fujifilm_default_crop() {
         let mut raf = b"FUJIFILMCCD-RAW 0201FF383501".to_vec();
         raf.resize(128, 0);
@@ -332,6 +373,26 @@ mod tests {
         assert_eq!(super::fuji_crop(f.path()), Some([16, 16, 6000, 4000]));
         std::fs::write(f.path(), b"FUJIFILMCCD-RAW").unwrap();
         assert_eq!(super::fuji_crop(f.path()), None);
+    }
+    #[test]
+    fn dng_without_baseline_exposure_uses_the_dng_default() {
+        let chart = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/corpus/charts/synthetic-d65.dng"
+        );
+        let mut bytes = std::fs::read(chart).unwrap();
+        // BaselineExposure, SRATIONAL, count 1: give it an invalid type so it is unread.
+        let entry = [0x2a, 0xc6, 10, 0, 1, 0, 0, 0];
+        let at = bytes.windows(8).position(|w| w == entry).unwrap();
+        bytes[at + 2] = 0;
+        // A closed file: Windows' LibRaw cannot open one a NamedTempFile holds open.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-baseline.dng");
+        std::fs::write(&path, bytes).unwrap();
+        let m = super::Raw::open(&path).unwrap().metadata;
+        // A camera without a table row would otherwise take the table's median.
+        assert_eq!(m.baseline_exposure, Some(0.));
+        assert_eq!(crate::camera_profiles::reference::baseline_exposure(&m), 0.);
     }
     #[test]
     fn corrupt_raw_is_an_error() {

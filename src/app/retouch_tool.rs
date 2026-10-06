@@ -61,6 +61,10 @@ enum Drag {
     Manual,
 }
 impl RetouchTool {
+    /// Whether a spot, its source or a brush stroke is being dragged.
+    pub(super) fn is_dragging(&self) -> bool {
+        !matches!(self.drag, Drag::None)
+    }
     pub(super) fn clear_document(&mut self) {
         self.selected = None;
         self.drag = Drag::None;
@@ -240,11 +244,7 @@ impl Editor {
         if let Drag::Stroke(points) = &tool.drag {
             let screen: Vec<Pos2> = points.iter().map(|p| to_screen(*p)).collect();
             let r = radius_on_screen(points[0], tool.size);
-            painter.add(egui::Shape::line(
-                screen.clone(),
-                egui::Stroke::new(2. * r.x.max(r.y), Color32::from_white_alpha(60)),
-            ));
-            overlay::path(&painter, screen, Color32::WHITE);
+            overlay::stroke_outline(&painter, &screen, r.x.max(r.y), 1.5);
         }
         if let Some(pos) = pointer
             && hovered.is_none()
@@ -297,7 +297,7 @@ impl Editor {
                 .automatic_source(&op, &[])
                 .unwrap_or([op.radius() * 3., 0.]);
         }
-        self.document.recipe.retouch.push(op);
+        self.document.recipe.add_retouch(op);
         let i = self.document.recipe.retouch.len() - 1;
         self.view.retouch.select(Some(i));
     }
@@ -544,12 +544,7 @@ fn draw_shape(
         RetouchShape::Brush { points, .. } => {
             let screen: Vec<Pos2> = points.iter().map(|p| place(*p)).collect();
             let r = radius(points[0], op.radius());
-            let fill = Color32::from_white_alpha(if dest { 50 } else { 30 });
-            painter.add(egui::Shape::line(
-                screen.clone(),
-                egui::Stroke::new(2. * r.x.max(r.y), fill),
-            ));
-            overlay::path(painter, screen, Color32::from_white_alpha(200));
+            overlay::stroke_outline(painter, &screen, r.x.max(r.y), width);
         }
     }
 }

@@ -1,4 +1,5 @@
 use super::Editor;
+use super::before_after::{Compare, Transfer};
 use super::dialogs::FileDialog;
 use super::icons::Icon;
 use super::widgets::{
@@ -44,12 +45,16 @@ impl Editor {
                         self.redo();
                     }
                     toolbar_divider(ui);
-                    if toolbar_action(ui, "Before", 70., self.view.compare, true, 3)
-                        .on_hover_text("Show original · Backslash")
+                    let before_only = self.view.compare.before_only();
+                    if toolbar_action(ui, "Before", 70., before_only, true, 3)
+                        .on_hover_text("Show Before · Backslash")
                         .clicked()
                     {
-                        self.view.compare = !self.view.compare;
+                        let view = self.view.compare.toggled(Compare::BeforeOnly);
+                        self.set_compare(view);
                     }
+                    self.before_after_menu(ui);
+                    self.reference_controls(ui);
                     if toolbar_action(ui, "Clipping", 78., self.view.clipping.both_on(), true, 0)
                         .on_hover_text("Show clipped shadows and highlights · J")
                         .clicked()
@@ -207,6 +212,89 @@ impl Editor {
                     });
                 });
             });
+    }
+    /// Reference View's button, and while it shows, its layout and lock, as in
+    /// Lightroom's toolbar.
+    fn reference_controls(&mut self, ui: &mut egui::Ui) {
+        use super::before_after::Axis;
+        let shown = self.reference_view();
+        if toolbar_action(ui, "Reference", 84., shown, true, 0)
+            .on_hover_text("Reference View · Shift+R")
+            .clicked()
+        {
+            self.toggle_reference_view();
+        }
+        if !shown {
+            return;
+        }
+        for (layout, label, width) in [
+            (Axis::LeftRight, "Left / Right", 92.),
+            (Axis::TopBottom, "Top / Bottom", 98.),
+        ] {
+            let chosen = self.view.compare == Compare::Reference(layout);
+            if toolbar_action(ui, label, width, chosen, true, 0).clicked() {
+                self.set_reference_layout(layout);
+            }
+        }
+        let locked = self.reference.locked;
+        if toolbar_action(ui, "Lock", 54., locked, self.reference.photo.is_some(), 0)
+            .on_hover_text(if locked {
+                "The reference photo stays when you leave Develop"
+            } else {
+                "Keep the reference photo when you leave Develop"
+            })
+            .clicked()
+        {
+            self.reference.locked = !locked;
+        }
+    }
+    /// Lightroom's Before/After menu: the views, with their keys, and copying or
+    /// swapping settings between the two sides.
+    fn before_after_menu(&mut self, ui: &mut egui::Ui) {
+        let two_up = self.view.compare.two_up() && self.view.compare.shows_before();
+        let button = toolbar_action(ui, "Before / After", 104., two_up, true, 0)
+            .on_hover_text("Before/After views · Y, Option+Y, Shift+Y");
+        let mac = cfg!(target_os = "macos");
+        let alt = if mac { "⌥ " } else { "Alt+" };
+        let transfer = if mac { "⌥⇧⌘ " } else { "Ctrl+Alt+Shift+" };
+        egui::Popup::menu(&button).show(|ui| {
+            ui.set_width(300.);
+            ui.spacing_mut().item_spacing.y = 0.;
+            for (view, name) in super::before_after::VIEWS {
+                let keys = match view {
+                    Compare::BeforeOnly => "\\".to_string(),
+                    Compare::SideBySide(super::before_after::Axis::LeftRight) => "Y".into(),
+                    Compare::SideBySide(_) => format!("{alt}Y"),
+                    Compare::Split(super::before_after::Axis::LeftRight) => "Shift+Y".into(),
+                    _ => String::new(),
+                };
+                if menu_item(ui, name, &keys, true, self.view.compare == view) {
+                    let view = self.view.compare.toggled(view);
+                    self.set_compare(view);
+                    ui.close();
+                }
+            }
+            menu_separator(ui);
+            for (transfer_kind, name, key) in [
+                (
+                    Transfer::BeforeToAfter,
+                    "Copy Before's Settings to After",
+                    "→",
+                ),
+                (
+                    Transfer::AfterToBefore,
+                    "Copy After's Settings to Before",
+                    "←",
+                ),
+                (Transfer::Swap, "Swap Before and After Settings", "↑"),
+            ] {
+                let keys = format!("{transfer}{key}");
+                if menu_item(ui, name, &keys, self.document.full().is_some(), false) {
+                    self.transfer(transfer_kind);
+                    ui.close();
+                }
+            }
+        });
     }
     /// Back to the raw defaults, like Lightroom's Reset.
     pub(super) fn reset_settings(&mut self) {

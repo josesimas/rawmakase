@@ -20,6 +20,7 @@ It is a personal project in active development. It develops photos from almost e
 - **Non-destructive**: originals are never modified. Edits live in the catalog, and all writes are atomic.
 - **Fast previews**: every change renders at viewport size, with the color and tone stage on the GPU (Metal on macOS, Vulkan on Linux, DirectX 12 or Vulkan on Windows) and a CPU fallback.
 - **Command line**: inspect, render, export thumbnails, import catalogs and profiles, and benchmark without the GUI.
+- **External control**: [MIDI controllers](docs/midi.md), [scripts](docs/automation.md), and a built-in [MCP server](docs/mcp.md) for agents to adjust the running editor, inspect previews, save and export.
 - **Updates**: the app checks GitHub for new releases; the Apple Silicon and Windows installer builds update themselves, other installs are pointed at the release page.
 
 ## Coming soon
@@ -127,11 +128,16 @@ Useful shortcuts:
 | Shift + rating, label or flag key | Apply and advance |
 | R or C | Crop |
 | J | Shadow and highlight clipping warnings (click a histogram triangle for one) |
-| Backslash | Before / after |
+| Backslash | Before alone |
+| Y / Option+Y / Shift+Y | Before and after: left and right / top and bottom / split |
+| I | Photo info over the photo: Info 1, Info 2, off |
+| Shift+R | Reference View: another photo beside the one you edit (drag it from the filmstrip) |
 | Cmd/Ctrl+Z, Cmd/Ctrl+Shift+Z | Undo / redo |
 | Cmd/Ctrl+Shift+U | Auto tone |
 
-Double-click a slider to reset it, or type its value for precision. Drag sideways in the histogram to move Blacks, Shadows, Exposure, Highlights or Whites, whichever region you start in.
+Double-click a slider or a color grading wheel to reset it, type its value for precision, or hover a slider and press Up or Down (Shift for ten steps). On a grading wheel, Shift keeps a drag to hue or saturation and Cmd/Ctrl moves it finely. Drag sideways in the histogram to move Blacks, Shadows, Exposure, Highlights or Whites, whichever region you start in.
+
+The switch in a panel's header turns the panel off without losing its settings, as in Lightroom; right-click a header for Solo Mode, where opening one panel closes the others on that side.
 
 ### Camera profiles
 

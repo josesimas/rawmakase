@@ -71,7 +71,7 @@ const GENERAL: [Shortcut; 5] = [
     ("Cmd+,", "Preferences"),
     ("Cmd+/", "These shortcuts"),
 ];
-const DEVELOP: [Shortcut; 31] = [
+const DEVELOP: [Shortcut; 47] = [
     ("R", "Crop & Straighten"),
     ("Return", "Finish the crop"),
     ("X", "Swap the crop's orientation"),
@@ -82,12 +82,33 @@ const DEVELOP: [Shortcut; 31] = [
     ("Q", "Spot removal"),
     ("Shift+W", "Masking"),
     ("W", "White balance selector"),
-    ("[ / ]", "Brush size (Shift: feather)"),
+    ("Cmd+Option+Shift+T", "Targeted adjustment: Tone Curve"),
+    (
+        "Cmd+Option+Shift+H / S / L",
+        "Targeted adjustment: Hue / Saturation / Luminance",
+    ),
+    ("Cmd+Option+Shift+G", "Targeted adjustment: B&W mix"),
+    ("Esc", "Put the open tool away"),
+    ("[ / ]", "Brush or red eye size (Shift: feather)"),
+    (
+        "Scroll",
+        "Brush or red eye size over the photo (Shift: feather)",
+    ),
     ("/", "New source for the selected spot"),
     ("H", "Hide spot pins"),
     ("A", "Visualize spots"),
     ("Space", "Pan while a tool is open"),
-    ("\\", "Before / after"),
+    ("\\", "Before alone"),
+    ("Y", "Before and after, left and right"),
+    ("Option+Y", "Before and after, top and bottom"),
+    ("Shift+Y", "Before and after, split"),
+    (
+        "Cmd+Option+Shift+→ / ←",
+        "Copy Before to After / After to Before",
+    ),
+    ("Cmd+Option+Shift+↑", "Swap Before and After"),
+    ("Shift+R", "Reference View"),
+    ("I", "Photo info overlay: Info 1, Info 2, off"),
     ("J", "Show shadow and highlight clipping"),
     ("Z / F", "Toggle zoom / fit"),
     ("Left / Right", "Previous / next photo"),
@@ -101,7 +122,11 @@ const DEVELOP: [Shortcut; 31] = [
     ("V", "Convert to black & white or back to color"),
     ("Cmd+Shift+E", "Export…"),
     ("Cmd+Alt+Shift+E", "Export with previous"),
-    ("double-click", "Reset a slider"),
+    ("double-click", "Reset a slider or grading wheel"),
+    ("Shift+drag", "Grading wheel: hue or saturation only"),
+    ("Cmd+drag", "Grading wheel: fine adjustment"),
+    ("Up / Down", "Nudge the hovered slider (Shift: 10)"),
+    ("right-click", "Panel header: Solo Mode"),
     ("E", "Show the photo in the Loupe"),
 ];
 

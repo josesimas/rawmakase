@@ -26,7 +26,7 @@ const FIELDS: &[(&str, usize)] = &[
     ("LOCAL", 1),
     ("LOCAL_SIZE", 2),
     ("LOCAL_SCALE", 2),
-    ("LOCAL_A", 2),
+    ("LOCAL_A", 3),
     ("SHADOWS", 4),
     ("HIGHLIGHTS", 4),
     ("BASIC", 1),
@@ -34,6 +34,8 @@ const FIELDS: &[(&str, usize)] = &[
     ("PARAMETRIC_ON", 1),
     ("PARAMETRIC", 4),
     ("SPLITS", 3),
+    // The measured parametric curve's table, or -1 (see `parametric::ParametricCurve`).
+    ("PARAMETRIC_LUT", 1),
     ("MASTER", 1),
     ("REFINE_SATURATION", 1),
     ("CHANNELS", 3),
@@ -45,10 +47,13 @@ const FIELDS: &[(&str, usize)] = &[
     ("RGB", 6),
     ("RGB_INTO", 9),
     ("RGB_BACK", 9),
-    ("GRADE", 3),
+    // Color grading: tables, samples and operator (see `color_grade::ColorGrade`).
+    ("GRADE", 4),
     ("ADJUST", 1),
     ("DEFRINGE", 2),
     ("DEFRINGE_RANGES", 4),
+    // 1 when out-of-gamut colors clip per channel (`GamutModel::Clip`).
+    ("GAMUT_CLIP", 1),
     ("MONO", 1),
     ("GRAY_MIX", 8),
     ("TONE_ONLY", 1),
@@ -59,20 +64,27 @@ const FIELDS: &[(&str, usize)] = &[
     ("EXPOSURE_EV", 1),
     ("LOCAL_WB", 6),
     ("LOCAL_TONE", 1),
+    // The masks' Contrast pivot, or -1 for the original Contrast before Whites and Blacks.
+    ("LOCAL_PIVOT", 1),
     ("LOCAL_FAMILIES", 1),
     ("LOCAL_KEYS", 2),
     ("GLOBAL_SH", 2),
 ];
 pub(crate) fn wgsl_prelude() -> String {
+    use crate::develop::point_color::{CONSTANT_PARAMS, SWATCH_PARAMS};
     let mut at = 0;
-    FIELDS
+    let fields: String = FIELDS
         .iter()
         .map(|(name, len)| {
             let line = format!("const P_{name}: u32 = {at}u;\n");
             at += len;
             line
         })
-        .collect()
+        .collect();
+    fields
+        + &format!(
+            "const POINT_CONSTANTS: i32 = {CONSTANT_PARAMS};\nconst POINT_SWATCH: i32 = {SWATCH_PARAMS};\n"
+        )
 }
 pub(crate) struct PixelParams {
     pub(crate) params: Vec<f32>,
@@ -89,6 +101,18 @@ impl PixelParams {
                 assert_eq!(values.len(), *len, "{name}");
                 self.params[at..at + len].copy_from_slice(values);
                 return;
+            }
+            at += len;
+        }
+        unreachable!("Unknown parameter {name}");
+    }
+    /// The values of parameter `name`.
+    #[cfg(test)]
+    pub(crate) fn get(&self, name: &str) -> &[f32] {
+        let mut at = 0;
+        for (field, len) in FIELDS {
+            if *field == name {
+                return &self.params[at..at + len];
             }
             at += len;
         }
@@ -123,7 +147,8 @@ pub(crate) fn supported(r: &Recipe) -> bool {
         && r.reference_calibration
         && r.profile_tone
         && r.profile.is_some()
-        // Blending and Balance outside the measured tables use the older operator.
+        // The original operator's Blending and Balance outside its tables use the
+        // older operator.
         && (!grading || crate::develop::color_grade::ColorGrade::new(r).is_some())
 }
 /// Parameters for `im`'s per-pixel stage with the resolved recipe `r`, or `None` when
@@ -145,11 +170,20 @@ fn masks_need_map(r: &Recipe) -> bool {
         .iter()
         .any(|m| m.is_active() && (m.adjust.shadows != 0. || m.adjust.highlights != 0.))
 }
-/// Whether `r`'s per-pixel stage needs the Shadows/Highlights map of the photo.
+/// Whether `r`'s per-pixel stage needs the Shadows/Highlights map of the photo, which
+/// also carries the measured Clarity.
 pub(crate) fn needs_map(r: &Recipe) -> bool {
     r.engine >= 4
         && r.reference_curves
-        && (r.shadows != 0. || r.highlights != 0. || masks_need_map(r))
+        && (r.shadows != 0.
+            || r.highlights != 0.
+            || crate::develop::clarity::measured(r) != 0.
+            || masks_need_map(r))
+}
+/// Whether a render needs the photo reduced for the Shadows/Highlights map or for
+/// measuring the photo's Contrast pivot; the stage cache keeps it between renders.
+pub(crate) fn needs_reduced(r: &Recipe) -> bool {
+    needs_map(r) || super::measures_contrast_pivot(r) || super::measures_whites(r)
 }
 /// Parameters that stop after the tone stage (`tone_stage`, before the map), to tone
 /// the reduced photo the Shadows/Highlights map is built from on the GPU.
@@ -158,7 +192,9 @@ pub(crate) fn tone_params(im: Source, r: &Recipe) -> Option<PixelParams> {
         return None;
     }
     let matrix = profile_matrix(&im.metadata, r);
-    let mut p = fill(r, CurveSet::new(r), matrix)?;
+    // The same parameters run the final pass once the map is built (`with_map`), so
+    // they carry this photo's Contrast pivot.
+    let mut p = fill(r, CurveSet::with_photo_measures(im, r, matrix), matrix)?;
     p.set("TONE_ONLY", &[1.]);
     Some(p)
 }
@@ -169,7 +205,11 @@ fn set_local(p: &mut PixelParams, local: &LocalToneMap) {
     p.set("LOCAL_SCALE", &local.scale);
     let a = p.push(local.a.iter().copied());
     let b = p.push(local.b.iter().copied());
-    p.set("LOCAL_A", &[a, b]);
+    let clarity = match &local.clarity {
+        Some(c) => p.push(c.iter().copied()),
+        None => -1.,
+    };
+    p.set("LOCAL_A", &[a, b, clarity]);
     for (name, curve) in [
         ("SHADOWS", &local.shadows),
         ("HIGHLIGHTS", &local.highlights),
@@ -261,11 +301,29 @@ fn fill(r: &Recipe, lut: CurveSet, matrix: [[f32; 3]; 3]) -> Option<PixelParams>
         None => -1.,
     };
     p.set("BASIC", &[basic]);
+    let tone = p.push(crate::develop::basic_tone::gpu_tables(&lut.photo.whites));
+    p.set("LOCAL_TONE", &[tone]);
+    p.set(
+        "LOCAL_PIVOT",
+        &[match lut.photo.contrast {
+            crate::develop::basic_tone::ContrastCurve::Original => -1.,
+            crate::develop::basic_tone::ContrastCurve::Pivot(pivot) => pivot,
+        }],
+    );
     p.set("LEVELS", &[r.black_point, r.white_point, r.midtone]);
     let e = &r.effects;
-    p.set("PARAMETRIC_ON", &[(e.parametric != [0.; 4]) as u8 as f32]);
+    // The original per-channel curve runs in `level`, the measured one after it.
+    p.set(
+        "PARAMETRIC_ON",
+        &[(lut.parametric.is_none() && e.parametric != [0.; 4]) as u8 as f32],
+    );
     p.set("PARAMETRIC", &e.parametric);
     p.set("SPLITS", &e.splits);
+    let parametric = match &lut.parametric {
+        Some(c) => p.push(c.values().iter().copied()),
+        None => -1.,
+    };
+    p.set("PARAMETRIC_LUT", &[parametric]);
     let master = p.push(lut.master.values().iter().copied());
     p.set("MASTER", &[master]);
     p.set("REFINE_SATURATION", &[r.curve_saturation.clamp(0., 1.)]);
@@ -285,18 +343,30 @@ fn fill(r: &Recipe, lut: CurveSet, matrix: [[f32; 3]; 3]) -> Option<PixelParams>
     };
     p.set("POINT", &point);
     set_rgb_table(&mut p, lut.rgb_table.as_ref());
+    use crate::develop::color_grade::ColorGrade;
     let grade = match &lut.grade {
-        Some(g) => [
+        Some(ColorGrade::Luminance(g)) => [
             p.push(g.gain.iter().flatten().copied()),
             p.push(g.offset.iter().flatten().copied()),
             g.gain.len() as f32,
+            0.,
         ],
-        None => [-1., -1., 0.],
+        Some(ColorGrade::Channels(c)) => [
+            p.push(c.gain.iter().flatten().copied()),
+            -1.,
+            c.gain.len() as f32,
+            1.,
+        ],
+        None => [-1., -1., 0., 0.],
     };
     p.set("GRADE", &grade);
     p.set("ADJUST", &[lut.color_adjustments as u8 as f32]);
     p.set("DEFRINGE", &e.defringe);
     p.set("DEFRINGE_RANGES", e.defringe_ranges.as_flattened());
+    p.set(
+        "GAMUT_CLIP",
+        &[(r.gamut_model == crate::develop::GamutModel::Clip) as u8 as f32],
+    );
     p.set("MONO", &[e.monochrome as u8 as f32]);
     p.set("GRAY_MIX", &e.gray_mix);
     Some(p)
@@ -329,8 +399,6 @@ impl PixelParams {
         self.set("MASK_DELTAS", &[deltas]);
         let math = local::LocalMath::new(&im.metadata, r);
         self.set("LOCAL_WB", math.white_balance.as_flattened());
-        let tone = self.push(crate::develop::basic_tone::gpu_tables());
-        self.set("LOCAL_TONE", &[tone]);
         let families = self.push(crate::develop::local_tone::gpu_families());
         self.set("LOCAL_FAMILIES", &[families]);
         let pixels = w.data.len() / n;

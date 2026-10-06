@@ -19,7 +19,8 @@ modes. The AI Remove mode is not implemented yet.
   stands out; its Threshold slider shows fainter detail.
 - Hold **Space** to pan while the tool is open.
 - The drawer's Mode, Size, Feather and Opacity apply to the selected spot, or to new
-  spots when none is selected.
+  spots when none is selected. The mouse wheel over the photo sizes the brush and
+  the selected spot (Shift: feather), as in Lightroom; one scroll is one History step.
 
 Paste Settings and presets leave a photo's spots alone, as Lightroom's defaults do.
 
@@ -36,6 +37,14 @@ Paste Settings and presets leave a photo's spots alone, as Lightroom's defaults 
   anything else, so every later edit, and export at full resolution, sees the
   retouched pixels.
 - **Clone** blends the source in with the feathered shape.
+- **Feather** follows Camera Raw 18.7, measured on Clone spots at Feather 25–100: a
+  table of the source's weight in the linear blend against the distance from the
+  centre, interpolated between those settings and from a hard edge below 25. On those
+  spots the rendered coverage is within a mean 0.003 of Camera Raw's (at most 0.07,
+  at Feather 25 on the rim's last pixel); the original smoothstep was 0.06–0.13 off,
+  its soft edge reaching much further in. Recipes saved before keep that original
+  feather (`retouch_model`); new edits, the first spot on a photo and Lightroom's
+  spots take the measured one.
 - **Heal** copies the source, then adds a membrane: the difference between
   destination and source on a one-pixel ring around the shape, extended inward by
   solving Laplace's equation (multigrid V-cycles, so large brushed areas solve as
@@ -59,9 +68,12 @@ Paste Settings and presets leave a photo's spots alone, as Lightroom's defaults 
 
 ## Not verified against Lightroom
 
-- Lightroom's exact feather profile, its automatic source choice and its heal
-  algorithm are not public; results look alike but are not measured against Camera
-  Raw.
+- Heal's correction was compared with Camera Raw 18.7 on flat and gradient
+  destinations healed from a brighter flat, a blue flat and a texture: inside the
+  spot RAWmakase is within 0.5 L* of Camera Raw, as close as the rest of the render.
+  The membrane itself is our own; Lightroom's algorithm is not public.
+- Lightroom's automatic source choice is not measured: Camera Raw renders the source
+  a file stores, so its choice can't be scripted.
 - Previews keep one full-resolution retouched copy of the photo in memory while it
   has spots.
 
@@ -76,10 +88,11 @@ The **Red Eye** tool sits between Remove and Masking, as in Lightroom Classic. L
 Lightroom's, it has no keyboard shortcut (Lightroom's menu leaves it unassigned, and
 Shift+R is its Reference View).
 
-- **Drag** from the centre of an eye outward to a circle that covers the whole eye:
-  RAWmakase finds the red pupil inside it and corrects it. **Click** to search a circle
-  of the last size. If nothing red enough is found, the status line says "Unable to
-  find red eye", as Lightroom does.
+- **Click** the centre of an eye: RAWmakase finds the red pupil inside the circle shown
+  around the pointer and corrects it. The mouse wheel over the photo, or **[** and
+  **]**, make the circle smaller or larger; dragging doesn't size it, as in Lightroom.
+  If nothing red enough is found, the status line says "Unable to find red eye", as
+  Lightroom does.
 - Click a correction to select it; drag it to move it. **Delete** removes the selected
   one, and Reset removes them all.
 - **Type** picks Red Eye or Pet Eye for new corrections, and changes the selected one.

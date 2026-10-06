@@ -2,7 +2,7 @@ use super::Editor;
 use super::state::Picture;
 use super::worker::{LoadJob, RenderJob};
 use crate::develop::{Geometry, Recipe};
-use eframe::egui;
+use eframe::egui::{self, Vec2};
 use std::path::PathBuf;
 
 impl Editor {
@@ -64,7 +64,14 @@ impl Editor {
         }
         self.document.reset(photo);
         let (id, cancel) = self.load.start();
+        // The reference photo stays on screen from photo to photo; Before goes.
+        let reference = self
+            .reference_view()
+            .then(|| std::mem::take(&mut self.preview.before));
         self.preview.clear_document();
+        if let Some(reference) = reference {
+            self.preview.before = reference;
+        }
         self.presets.clear_document();
         self.view.clear_document();
         self.status = "Reading RAW…".into();
@@ -75,6 +82,8 @@ impl Editor {
             prefetch,
             defaults: self.raw_defaults.clone(),
         });
+        // The photo left may be the reference, or its edit may have changed.
+        self.load_reference();
         true
     }
     /// The photo to decode ahead of time while `id` is shown: the next one in
@@ -202,19 +211,13 @@ impl Editor {
     }
     pub(super) fn history(&mut self, old: Recipe) {
         if self.document.history.record(old, &self.document.recipe) {
+            self.sync_command_revision();
             self.document.save.mark_changed();
         }
     }
     pub(super) fn effective_recipe(&self) -> Recipe {
-        let mut r = if self.view.compare {
-            // Before: the raw defaults.
-            let mut r = self.photo_defaults().map(|d| d.recipe).unwrap_or_default();
-            r.crop = self.document.recipe.crop;
-            r.rotation = self.document.recipe.rotation;
-            r.flip_x = self.document.recipe.flip_x;
-            r.flip_y = self.document.recipe.flip_y;
-            r.straighten = self.document.recipe.straighten;
-            r
+        let mut r = if self.view.compare.before_only() {
+            self.before_settings()
         } else {
             self.presets
                 .preview
@@ -232,6 +235,19 @@ impl Editor {
             r = r.as_rendered().into_owned();
         }
         r
+    }
+    /// The swatch Point Color's Visualize Range shows, while its tab is open on a color
+    /// photo in Develop.
+    /// Not while an eyedropper is out, which samples the photo as it renders, nor in
+    /// Before, which shows the photo's defaults.
+    pub(super) fn visualized_swatch(&self) -> Option<usize> {
+        let pc = &self.view.point_color;
+        let shown = pc.visualize
+            && self.point_color_tab_shown()
+            && !self.view.picks_color()
+            && !self.view.compare.before_only();
+        pc.selected
+            .filter(|i| shown && *i < self.document.recipe.point_colors.len())
     }
     /// What the active tool draws into the rendered preview.
     pub(super) fn overlay(&self) -> super::worker::Overlay {
@@ -254,62 +270,64 @@ impl Editor {
     /// The 1:1 region to render when zoomed to 100% or more; below 100% the
     /// whole photo is rendered at the zoomed size instead.
     pub(super) fn region(&self) -> Option<[u32; 4]> {
-        if !self.view.zoom.on || self.view.zoom.level < 1. {
-            return None;
-        }
         let im = self.document.full()?;
-        let g = Geometry::new(im, &self.effective_recipe(), 0);
-        let z = self.view.zoom.level;
-        let w = ((self.view.viewport.x / z).ceil() as u32).clamp(1, g.width);
-        let h = ((self.view.viewport.y / z).ceil() as u32).clamp(1, g.height);
-        let x = (self.view.zoom.pan[0] * g.width as f32 - w as f32 / 2.)
-            .round()
-            .clamp(0., (g.width - w) as f32) as u32;
-        let y = (self.view.zoom.pan[1] * g.height as f32 - h as f32 / 2.)
-            .round()
-            .clamp(0., (g.height - h) as f32) as u32;
-        Some([x, y, w, h])
+        self.region_in(&Geometry::new(im, &self.effective_recipe(), 0))
+    }
+    /// The 1:1 region of a photo with geometry `g` that the view shows, as `region`.
+    pub(super) fn region_in(&self, g: &Geometry) -> Option<[u32; 4]> {
+        self.view.zoom.region(self.view.viewport, g.width, g.height)
     }
     pub(super) fn schedule(&mut self) {
         let image = self.document.full().cloned();
         if let Some(image) = image {
+            self.yield_before();
             let (id, cancel) = self.preview.task.start();
             let region = self.region();
             self.preview.last_region = region;
             let geometry = Geometry::new(&image, &self.effective_recipe(), 0);
-            let fit = crate::develop::quality::fit_edge(
-                geometry.width,
-                geometry.height,
-                [self.view.viewport.x as u32, self.view.viewport.y as u32],
-            );
+            let RenderEdges { fit, max_edge } = self.render_edges(&geometry);
             self.preview.last_fit_edge = fit;
-            let max_edge = if self.view.zoom.on && self.view.zoom.level < 1. {
-                (geometry.width.max(geometry.height) as f32 * self.view.zoom.level).round() as u32
-            } else {
-                fit
-            };
             self.preview.pending_crop = geometry.crop();
-            self.preview.pending_recipe = Some(self.effective_recipe());
             self.preview.pending_mode = region.map_or(
                 super::state::TextureMode::Whole,
                 super::state::TextureMode::Region,
             );
+            // Visualize Range renders the selected swatch's selection instead of its
+            // adjustment; never as the photo's thumbnail.
+            let mut recipe = self.effective_recipe();
+            let visualize = self.visualized_swatch().and_then(|i| {
+                crate::develop::point_color::visualize_range(&recipe.point_colors, i)
+            });
+            let thumbnail = region.is_none() && self.shows_library_edit() && visualize.is_none();
+            if let Some(list) = visualize {
+                recipe.point_colors = list;
+            }
+            // What the shown pixels were rendered with, Visualize Range included, so
+            // a picker never takes a gray preview for the photo.
+            self.preview.pending_recipe = Some(recipe.clone());
             self.renderer.submit(RenderJob {
+                pane: super::worker::Pane::After,
                 max_edge,
                 cancel,
                 id,
                 image,
-                recipe: self.effective_recipe(),
+                recipe,
                 region,
                 monitor: self.view.monitor.clone(),
                 clipping: self.view.clipping.overlay(),
                 navigator: !self.view.zoom.on || self.preview.navigator.is_none(),
-                thumbnail: region.is_none() && self.shows_library_edit(),
-                samples: self.view.picks_color(),
+                thumbnail,
+                samples: self.wants_samples(),
                 overlay: self.overlay(),
                 drawn: self.preview.presented(),
             });
         }
+        self.schedule_before();
+    }
+    /// The long edge a Fit render of a photo with geometry `g` needs in the view,
+    /// and the one to render at the current zoom.
+    pub(super) fn render_edges(&self, g: &Geometry) -> RenderEdges {
+        render_edges(&self.view.zoom, self.view.viewport, g)
     }
     /// A CPU render: the whole photo, or a 100% region drawn over it.
     pub(super) fn set_pixels(
@@ -364,4 +382,31 @@ impl Editor {
             self.develop_catalog_photo(next);
         }
     }
+}
+
+/// The long edges a render of a photo with geometry `g` needs in a view of
+/// `viewport` pixels at `zoom`.
+pub(super) fn render_edges(
+    zoom: &super::navigator::Zoom,
+    viewport: Vec2,
+    g: &Geometry,
+) -> RenderEdges {
+    let fit = crate::develop::quality::fit_edge(
+        g.width,
+        g.height,
+        [viewport.x as u32, viewport.y as u32],
+    );
+    let max_edge = if zoom.on && zoom.level < 1. {
+        (g.width.max(g.height) as f32 * zoom.level).round() as u32
+    } else {
+        fit
+    };
+    RenderEdges { fit, max_edge }
+}
+/// The long edges of a render, from `Editor::render_edges`.
+pub(super) struct RenderEdges {
+    /// The view's Fit size.
+    pub(super) fit: u32,
+    /// What to render at the current zoom: Fit, or smaller zoomed out.
+    pub(super) max_edge: u32,
 }
